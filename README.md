@@ -114,9 +114,10 @@ QoS 설정 확인:
 ```bash
 ros2 topic info /projection_image --verbose
 ```
-<img width="1218" height="506" alt="image" src="https://github.com/user-attachments/assets/7076d61f-a6c6-4af6-b385-39ac9c4156bc" />
+<img width="1310" height="508" alt="image" src="https://github.com/user-attachments/assets/19fa7165-1142-456a-ba09-36a93ecb4a1a" />
 
-잘보인다
+
+잘보이는것같기도 하지만 왼쪽 아래의 평면방정식을 바굴때마다 이미지의 모양이 달라져야하는데 그게 안된다. 퍼블리시 속도가 매우느리고 왜 최신화가 느린지는 모르겠다. 
 
 ## Dependencies
 
