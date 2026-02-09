@@ -114,14 +114,9 @@ QoS 설정 확인:
 ```bash
 ros2 topic info /projection_image --verbose
 ```
-왜 안보일까 
+<img width="1218" height="506" alt="image" src="https://github.com/user-attachments/assets/7076d61f-a6c6-4af6-b385-39ac9c4156bc" />
 
-```bash
-ros2 topic echo /projection_image
-```
-할때는 정상적으로 이미지 타입처럼 보이는데 
-rqt나 rviz에서 보려고하면 안보인다.
-
+잘보인다
 
 ## Dependencies
 
