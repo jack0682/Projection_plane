@@ -6,7 +6,7 @@ import numpy as np
 import datetime
 import os
 
-from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
+from sensor_msgs.msg import PointCloud2, PointField, Image
 from shape_msgs.msg import Plane
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Header
@@ -64,7 +64,7 @@ class ProjectionNode(Node):
         )
         self.pub_cloud = self.create_publisher(PointCloud2, 'input_cloud', qos_profile)
         self.pub_pose = self.create_publisher(PoseStamped, 'projection_pose', qos_profile)
-        self.pub_image = self.create_publisher(CompressedImage, 'projection_image/compressed', qos_profile)
+        self.pub_image = self.create_publisher(Image, 'projection_image', qos_profile)
 
         # Subscriber for plane
         self.sub_plane = self.create_subscription(
@@ -153,21 +153,19 @@ class ProjectionNode(Node):
             # When camera is available, subscribe to camera TF and publish here
             self.get_logger().debug("Pose publishing skipped (no camera TF available)")
             
-            # 11. Publish Compressed Image (JPEG)
+            # 11. Publish Raw Image (BGR8)
             try:
-                # JPEG compress the image
-                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]  # 90% quality
-                success, encoded = cv2.imencode('.jpg', image, encode_param)
-                if success:
-                    img_msg = CompressedImage()
-                    img_msg.header.frame_id = "projection_frame"
-                    img_msg.header.stamp = self.get_clock().now().to_msg()
-                    img_msg.format = "jpeg"
-                    img_msg.data = encoded.tobytes()
-                    self.pub_image.publish(img_msg)
-                    self.get_logger().info(f"Published compressed image ({W}x{H}, {len(img_msg.data)/1024:.1f}KB) to /projection_image/compressed")
-                else:
-                    self.get_logger().error("Failed to encode image to JPEG")
+                img_msg = Image()
+                img_msg.header.frame_id = "projection_frame"
+                img_msg.header.stamp = self.get_clock().now().to_msg()
+                img_msg.height = image.shape[0]
+                img_msg.width = image.shape[1]
+                img_msg.encoding = "bgr8"
+                img_msg.is_bigendian = False
+                img_msg.step = image.shape[1] * 3  # 3 channels (BGR)
+                img_msg.data = image.tobytes()
+                self.pub_image.publish(img_msg)
+                self.get_logger().info(f"Published raw image ({W}x{H}, {len(img_msg.data)/1024/1024:.1f}MB) to /projection_image")
             except Exception as e:
                 self.get_logger().error(f"Failed to publish image: {e}")
             
