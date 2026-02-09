@@ -6,10 +6,12 @@ import numpy as np
 import datetime
 import os
 
-from sensor_msgs.msg import PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
 from shape_msgs.msg import Plane
+from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Header
 from sensor_msgs_py import point_cloud2
+from scipy.spatial.transform import Rotation
 from rclpy.qos import QoSProfile, DurabilityPolicy
 
 from projection_plane.core import (
@@ -34,10 +36,11 @@ class ProjectionNode(Node):
         self.declare_parameter('plane_n', [0.0, 0.0, 1.0])
         self.declare_parameter('plane_d', 0.0)
         self.declare_parameter('input_file', '/home/jack/ros2_ws/project_hj_v2/241108_converted - Cloud.ply')
-        self.declare_parameter('output_file', '/home/jack/ros2_ws/output/projection_ros{timestamp}.png')
+        self.declare_parameter('output_file', '/home/jack/ros2_ws/output/projection_{timestamp}.png')
         self.declare_parameter('pixels_per_unit', 500.0)
         self.declare_parameter('origin_mode', 'mean')
         self.declare_parameter('depth_priority_far', False)
+        self.declare_parameter('save_image', False)  # Disable file saving by default
         
         # Get parameters
         self.plane_n = self.get_parameter('plane_n').value
@@ -47,6 +50,7 @@ class ProjectionNode(Node):
         self.pixels_per_unit = self.get_parameter('pixels_per_unit').value
         self.origin_mode = self.get_parameter('origin_mode').value
         self.depth_priority_far = self.get_parameter('depth_priority_far').value
+        self.save_image = self.get_parameter('save_image').value
         
         if not self.input_file:
             self.get_logger().error("Parameter 'input_file' is required.")
@@ -59,6 +63,8 @@ class ProjectionNode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
         self.pub_cloud = self.create_publisher(PointCloud2, 'input_cloud', qos_profile)
+        self.pub_pose = self.create_publisher(PoseStamped, 'projection_pose', qos_profile)
+        self.pub_image = self.create_publisher(CompressedImage, 'projection_image/compressed', qos_profile)
 
         # Subscriber for plane
         self.sub_plane = self.create_subscription(
@@ -142,40 +148,74 @@ class ProjectionNode(Node):
             coverage = pixels_written / (W * H) * 100
             self.get_logger().info(f"Coverage: {coverage:.2f}%")
             
-            # 10. Save
-            if not self.output_file:
+            # 10. Publish Camera Pose (placeholder - requires actual camera TF)
+            # Currently not publishing since no camera is connected
+            # When camera is available, subscribe to camera TF and publish here
+            self.get_logger().debug("Pose publishing skipped (no camera TF available)")
+            
+            # 11. Publish Compressed Image (JPEG)
+            try:
+                # JPEG compress the image
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]  # 90% quality
+                success, encoded = cv2.imencode('.jpg', image, encode_param)
+                if success:
+                    img_msg = CompressedImage()
+                    img_msg.header.frame_id = "projection_frame"
+                    img_msg.header.stamp = self.get_clock().now().to_msg()
+                    img_msg.format = "jpeg"
+                    img_msg.data = encoded.tobytes()
+                    self.pub_image.publish(img_msg)
+                    self.get_logger().info(f"Published compressed image ({W}x{H}, {len(img_msg.data)/1024:.1f}KB) to /projection_image/compressed")
+                else:
+                    self.get_logger().error("Failed to encode image to JPEG")
+            except Exception as e:
+                self.get_logger().error(f"Failed to publish image: {e}")
+            
+            # 12. Save (optional)
+            if self.save_image:
                 timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-                final_output_file = f"projection_ros_{timestamp}.png"
-            else:
-                # Handle {timestamp} placeholder if present
-                if '{timestamp}' in self.output_file:
-                    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                
+                if not self.output_file:
+                    # Default fallback if parameter is completely empty
+                    final_output_file = f"/home/jack/ros2_ws/output/projection_{timestamp}.png"
+                else:
+                    # Handle placeholders
                     try:
+                        # Try using .format() which handles {timestamp}
                         final_output_file = self.output_file.format(timestamp=timestamp)
                     except Exception:
-                        # Fallback if format fails (e.g. other braces)
-                        final_output_file = self.output_file.replace('{timestamp}', timestamp)
-                else:
-                    final_output_file = self.output_file
+                        # If .format() fails (e.g. user has other braces), try simple replace
+                        if '{timestamp}' in self.output_file:
+                            final_output_file = self.output_file.replace('{timestamp}', timestamp)
+                        else:
+                            # If no placeholder, just use as is (might overwrite!)
+                            # But wait, if it's a directory, we should append filename
+                            if os.path.isdir(self.output_file) or self.output_file.endswith('/'):
+                                final_output_file = os.path.join(self.output_file, f"projection_{timestamp}.png")
+                            else:
+                                final_output_file = self.output_file
 
-            # Ensure directory exists
-            output_dir = os.path.dirname(final_output_file)
-            if output_dir and not os.path.exists(output_dir):
+                # Ensure directory exists
+                output_dir = os.path.dirname(final_output_file)
+                if output_dir and not os.path.exists(output_dir):
+                    try:
+                        os.makedirs(output_dir)
+                        self.get_logger().info(f"Created output directory: {output_dir}")
+                    except OSError as e:
+                        self.get_logger().error(f"Failed to create output directory: {e}")
+
+                # cv2.imwrite might fail if extension is missing or invalid
+                if not os.path.splitext(final_output_file)[1]:
+                     final_output_file += ".png"
+                
                 try:
-                    os.makedirs(output_dir)
-                    self.get_logger().info(f"Created output directory: {output_dir}")
-                except OSError as e:
-                    self.get_logger().error(f"Failed to create output directory: {e}")
-
-            # cv2.imwrite might fail if extension is missing or invalid
-            if not os.path.splitext(final_output_file)[1]:
-                 final_output_file += ".png"
-            
-            success = cv2.imwrite(final_output_file, image)
-            if success:
-                self.get_logger().info(f"Saved output to {final_output_file}")
-            else:
-                self.get_logger().error(f"Failed to save image to {final_output_file}. check path permissions or extension.")
+                    success = cv2.imwrite(final_output_file, image)
+                    if success:
+                        self.get_logger().info(f"Saved output to {final_output_file}")
+                    else:
+                        self.get_logger().error(f"Failed to save image to {final_output_file}. check path permissions or extension.")
+                except Exception as e:
+                    self.get_logger().error(f"Failed to save image to {final_output_file}: {e}")
             
         except Exception as e:
             self.get_logger().error(f"Projection failed: {str(e)}")
