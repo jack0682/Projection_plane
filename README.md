@@ -114,7 +114,14 @@ QoS 설정 확인:
 ```bash
 ros2 topic info /projection_image --verbose
 ```
-RViz에서 `Reliability: Reliable`, `Durability: Transient Local` 설정 필요
+왜 안보일까 
+
+```bash
+ros2 topic echo /projection_image
+```
+할때는 정상적으로 이미지 타입처럼 보이는데 
+rqt나 rviz에서 보려고하면 안보인다.
+
 
 ## Dependencies
 
