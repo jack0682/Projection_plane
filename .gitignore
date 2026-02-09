@@ -1,5 +1,21 @@
-/*
-!/.gitignore
-!/src/
-/src/*
-!/src/projection_plane/
+# Build and install directories
+build/
+install/
+log/
+
+# Output directory
+output/
+
+# Data folder
+project_hj_v2/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# ROS2 generated
+*.egg-info/
