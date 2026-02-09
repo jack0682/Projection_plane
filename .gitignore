@@ -13,6 +13,9 @@ project_hj_v2/
 __pycache__/
 *.pyc
 
+# Images
+*.png
+
 # IDE
 .vscode/
 .idea/
