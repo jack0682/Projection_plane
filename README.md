@@ -45,11 +45,6 @@
 - Baseline: 순차적 Z-버퍼 (O(N), 정확성 보장)
 - Fast-Stable: 정렬 기반 (O(N log N), point_size=1일 때 동일)
 
-**Phase-3: 대규모 포인트 클라우드**
-- 복셀 그리드 다운샘플링
-- 선택적 렌더링 (원본 또는 다운샘플)
-- 별도 클라우드 발행
-
 ---
 
 ## 설치 및 빌드
@@ -194,29 +189,6 @@ ros2 topic info /projection/image
 
 ---
 
-### ✅ Phase-3: 대규모 포인트 클라우드 처리
-
-#### 복셀 그리드 다운샘플링
-- **PCL 통합**: `pcl::VoxelGrid` 필터 사용
-- **파라미터**:
-  - `enable_downsample`: 활성화 (기본: false)
-  - `voxel_leaf_size`: 복셀 크기 미터 (기본: 0.01m)
-
-- **선택적 사용**:
-  - `use_downsample_for_projection`: 다운샘플 클라우드 사용 여부
-  - `publish_downsample_cloud`: 다운샘플 클라우드 발행 여부
-
-- **메모리 캐싱**: 원본 및 다운샘플 클라우드 메모리에 유지
-- 구현: `projection_plane_node.cpp` 라인 264-310
-
-#### 클라우드 발행
-- `/projection/cloud_raw`: 원본 해상도 (Transient Local QoS)
-- `/projection/cloud_render`: 다운샘플 (다운샘플 활성화 시에만)
-- 형식: `sensor_msgs/PointCloud2` RGB 색상 포함
-- 구현: `projection_plane_node.cpp` 라인 312-370
-
----
-
 ## ROS2 통합
 
 ### 노드 아키텍처
@@ -250,7 +222,6 @@ Worker Thread (Async Computation)
 |------|-----------|-----|------|
 | `/projection/image` | `sensor_msgs/Image` (BGR8) | Default | 투영 결과 이미지 |
 | `/projection/cloud_raw` | `sensor_msgs/PointCloud2` | Transient Local | 원본 포인트 클라우드 |
-| `/projection/cloud_render` | `sensor_msgs/PointCloud2` | Transient Local | 다운샘플 클라우드 |
 | `/projection/camera_pose` | `geometry_msgs/PoseStamped` | Default | 릴레이된 카메라 포즈 |
 
 ### 비동기 처리
@@ -310,10 +281,6 @@ Worker Thread (Async Computation)
 | 파라미터 | 타입 | 기본값 | 설명 |
 |---------|------|--------|------|
 | `ply_path` | string | (필수) | PLY 파일 경로 |
-| `enable_downsample` | bool | false | 다운샘플링 활성화 |
-| `voxel_leaf_size` | double | 0.01 | 복셀 크기 (미터) |
-| `use_downsample_for_projection` | bool | true | 투영에 다운샘플 사용 |
-| `publish_downsample_cloud` | bool | true | 다운샘플 클라우드 발행 |
 
 ### 디버그 파라미터
 
@@ -339,10 +306,6 @@ Worker Thread (Async Computation)
     point_size: 1
     raster_mode: "baseline"
     publish_rate_hz: 10.0
-    enable_downsample: false
-    voxel_leaf_size: 0.01
-    use_downsample_for_projection: true
-    publish_downsample_cloud: true
     up_hint_x: 0.0
     up_hint_y: 0.0
     up_hint_z: 1.0
@@ -432,17 +395,11 @@ for each pixel_idx in sorted order:
 - **공간**: O(N) 인덱스 + 방문 집합
 - **적합**: 대규모 클라우드 (N > 100K), point_size=1, 성능 중시
 
-### 다운샘플링 영향
-- 복셀 그리드: O(N)
-- 포인트 감소: 50-99% (복셀 크기에 따름)
-- 투영 속도: 감소 비율과 거의 같음
-
 ### 실제 추정치
 | 시나리오 | 시간 |
 |---------|------|
 | 100K 포인트, baseline | 1-5 ms |
 | 1M 포인트, fast_stable | 10-50 ms |
-| 1M 포인트 → 10K 다운샘플, baseline | 0.5-2 ms |
 
 ---
 
@@ -485,7 +442,6 @@ for each pixel_idx in sorted order:
 #### projection_plane_node.cpp (530줄)
 - ROS2 노드 구현
 - PLY 파일 로딩 (PCL)
-- 다운샘플링
 - 비동기 투영 (워커 스레드)
 - 토픽 발행/구독
 
@@ -617,17 +573,13 @@ bash /home/jack/ros2_ws/src/projection_plane/test_projection.sh
 ```bash
 # 문제: Slow projection updates
 # 해결책:
-1. 다운샘플링 활성화
-   ros2 param set /projection_plane_node enable_downsample true
-   ros2 param set /projection_plane_node voxel_leaf_size 0.01
-
-2. Fast-Stable 모드로 전환 (point_size=1)
+1. Fast-Stable 모드로 전환 (point_size=1)
    ros2 param set /projection_plane_node raster_mode fast_stable
 
-3. CPU 로드 확인
+2. CPU 로드 확인
    top -b -n 1 | grep projection_plane
 
-4. ROS2 성능 프로파일링
+3. ROS2 성능 프로파일링
    ros2 trace --all-but-kernel /tmp/ros2_trace
 ```
 
@@ -636,17 +588,11 @@ bash /home/jack/ros2_ws/src/projection_plane/test_projection.sh
 ```bash
 # 문제: Memory issues
 # 해결책:
-1. 다운샘플링 강화
-   ros2 param set /projection_plane_node voxel_leaf_size 0.02
-
-2. 다운샘플 사용
-   ros2 param set /projection_plane_node use_downsample_for_projection true
-
-3. 이미지 크기 명시 (큰 값 피함)
+1. 이미지 크기 명시 (큰 값 피함)
    ros2 param set /projection_plane_node width 512
    ros2 param set /projection_plane_node height 512
 
-4. 메모리 사용량 확인
+2. 메모리 사용량 확인
    ps aux | grep projection_plane
 ```
 
