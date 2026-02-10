@@ -45,10 +45,6 @@
 - Z-버퍼링 (near-first / far-first)
 - 여러 원점 계산 모드 (mean / closest)
 
-**Phase-2: 고성능 모드**
-- Baseline: 순차적 Z-버퍼 (O(N), 정확성 보장)
-- Fast-Stable: 정렬 기반 (O(N log N), point_size=1일 때 동일)
-
 ---
 
 ## 설치 및 빌드
@@ -171,28 +167,6 @@ ros2 topic info /projection/image
 
 ---
 
-### ✅ Phase-2: 고성능 모드
-
-#### Fast-Stable 래스터화
-- **알고리즘**: 순차 Z-버퍼 대신 정렬 사용
-- **핵심 아이디어**:
-  - 픽셀별로 정렬: (pixel_idx, depth_order, original_index)
-  - 각 픽셀에서 정렬 순서의 첫 발생이 우승자
-  - 순차 Z-테스트와 동등
-
-- **성능**: O(N log N) 정렬 vs O(N) 순차
-- **정확성 보장**: point_size=1일 때만
-- **폴백**: point_size > 1일 때는 baseline으로 자동 복귀 (경고 출력)
-- 구현: `rasterizer.hpp` 라인 116-268
-
-#### 모드 선택
-- **파라미터**: `raster_mode` ("baseline" | "fast_stable")
-- **기본값**: "baseline" (정확성 보장)
-- **통합 인터페이스**: `rasterize()` 함수가 모드에 따라 디스패치
-- 구현: `rasterizer.hpp` 라인 271-295
-
----
-
 ## ROS2 통합
 
 ### 노드 아키텍처
@@ -294,7 +268,6 @@ Worker Thread (Async Computation)
 | 파라미터 | 타입 | 기본값 | 설명 |
 |---------|------|--------|------|
 | `point_size` | int | 1 | 픽셀당 포인트 크기 |
-| `raster_mode` | string | "baseline" | "baseline" 또는 "fast_stable" |
 | `publish_rate_hz` | double | 10.0 | 발행 빈도 |
 
 ### 데이터 관리 파라미터
@@ -325,7 +298,6 @@ Worker Thread (Async Computation)
     percentile_low: 1.0
     percentile_high: 99.0
     point_size: 1
-    raster_mode: "baseline"
     publish_rate_hz: 10.0
     up_hint_x: 0.0
     up_hint_y: 0.0
@@ -371,10 +343,10 @@ Worker Thread (Async Computation)
    └─ 자동 계산 또는 명시적 오버라이드
 
 10. 래스터화
-    └─ Z-버퍼 또는 정렬 기반 알고리즘
+    └─ Z-버퍼 알고리즘
 ```
 
-### Baseline (순차적 Z-버퍼)
+### 래스터화 (순차적 Z-버퍼)
 
 ```cpp
 for each point in original order:
@@ -388,19 +360,7 @@ for each point in original order:
         image[py][px] = color
 ```
 
-**보장**: Python과 비트 단위로 동일, point_size > 1에 정확
-
-### Fast-Stable (정렬 기반)
-
-```cpp
-compute px, py, idx (pixel index) for all points
-stable sort by (idx, depth order, original_index)
-for each pixel_idx in sorted order:
-    if first occurrence:
-        write color at pixel
-```
-
-**보장**: point_size=1일 때 baseline과 동일, 대규모 포인트 클라우드에서 빠름
+**보장**: Python과 비트 단위로 동일
 
 ---
 
@@ -461,9 +421,7 @@ for each pixel_idx in sorted order:
 - ROS2나 I/O 없는 순수 C++17
 
 #### rasterizer.hpp (295줄)
-- rasterize_baseline(): 순차 Z-버퍼
-- rasterize_fast_stable(): 정렬 기반
-- rasterize(): 통합 인터페이스
+- rasterize(): Z-버퍼 래스터화
 - OpenCV 이미지 저장소
 
 #### projection_plane_node.cpp (530줄)
@@ -524,8 +482,7 @@ bash /home/jack/ros2_ws/src/projection_plane/test_projection.sh
 - ✅ map_uv(): 좌표 매핑
 - ✅ compute_depth(): abs, signed 모드
 - ✅ compute_image_size(): 범위, 클램핑
-- ✅ rasterize_baseline(): 순차 Z-버퍼
-- ✅ rasterize_fast_stable(): 정렬 동등성 (point_size=1)
+- ✅ rasterize(): Z-버퍼 래스터화
 
 ### ROS2 통합 테스트
 
@@ -544,10 +501,6 @@ bash /home/jack/ros2_ws/src/projection_plane/test_projection.sh
 1. C++에서 저장: `save_png_path: /tmp/cpp_output.png`
 2. Python 참조와 실행
 3. 픽셀별 비교: `compare -metric RMSE ref.png cpp.png`
-
-#### Baseline vs Fast-Stable
-- point_size=1: 동일
-- point_size > 1: baseline 사용
 
 ---
 
@@ -600,13 +553,10 @@ bash /home/jack/ros2_ws/src/projection_plane/test_projection.sh
 ```bash
 # 문제: Slow projection updates
 # 해결책:
-1. Fast-Stable 모드로 전환 (point_size=1)
-   ros2 param set /projection_plane_node raster_mode fast_stable
-
-2. CPU 로드 확인
+1. CPU 로드 확인
    top -b -n 1 | grep projection_plane
 
-3. ROS2 성능 프로파일링
+2. ROS2 성능 프로파일링
    ros2 trace --all-but-kernel /tmp/ros2_trace
 ```
 
