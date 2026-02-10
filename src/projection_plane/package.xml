@@ -2,10 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>projection_plane</name>
-  <version>0.1.0</version>
-  <description>High-performance point cloud projection to 2D plane in C++ with ROS2</description>
-  <maintainer email="jack0682@github.com">jack</maintainer>
-  <license>Apache License 2.0</license>
+  <version>0.0.1</version>
+  <description>Orthographic projection of point clouds onto a plane (C++)</description>
+  <maintainer email="jack@example.com">Jack</maintainer>
+  <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
@@ -18,8 +18,6 @@
   <depend>image_transport</depend>
   <depend>pcl_conversions</depend>
   <depend>pcl_ros</depend>
-  <depend>Eigen3</depend>
-  <depend>OpenCV</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

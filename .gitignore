@@ -8,6 +8,8 @@ output/
 
 # Data folder
 project_hj_v2/
+sam_3d_test/
+runs/
 
 # Python cache
 __pycache__/
@@ -15,10 +17,13 @@ __pycache__/
 
 # Images
 *.png
+*.pt
 
 # IDE
 .vscode/
 .idea/
+.claude/
+.venv/
 
 # ROS2 generated
 *.egg-info/

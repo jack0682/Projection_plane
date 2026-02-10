@@ -1,37 +1,9 @@
-/**:
+projection_node:
   ros__parameters:
-    # Point cloud file path
-    ply_path: "/home/jack/Last_point/pcd_file/241108_converted - Cloud.ply"
-
-    # Projection parameters
-    pixels_per_unit: 500.0  # Resolution: pixels per unit distance
-    width: -1              # Image width (-1 = auto)
-    height: -1             # Image height (-1 = auto)
-
-    # Depth handling
-    depth_priority_far: false  # true = far points win, false = near points win
-    depth_mode: "abs"          # "abs" = absolute distance, "signed" = signed distance
-
-    # Origin computation
-    origin_mode: "mean"     # "mean" = centroid of projected points, "closest" = closest to world origin
-
-    # Range robustness
-    robust_range: false    # Use percentile-based range instead of min/max
-    percentile_low: 1.0    # Lower percentile for robust range
-    percentile_high: 99.0  # Upper percentile for robust range
-
-    # Rendering
-    point_size: 1          # Size of each point in pixels
-    raster_mode: "baseline"  # "baseline" = sequential z-buffer, "fast_stable" = sorting-based
-
-    # Publishing
-    publish_rate_hz: 10.0  # Rate at which to publish projection images
-
-    # Up hint for basis construction (optional)
-    # Set all three to define custom up hint, or leave as NaN for automatic
-    up_hint_x: 0.0  # NaN to disable
-    up_hint_y: 0.0  # NaN to disable
-    up_hint_z: 1.0  # NaN to disable
-
-    # Debug output
-    save_png_path: ""  # Empty string = no saving, or set path to save projection image
+    plane_n: [0.0, 0.0, 1.0]
+    plane_d: 0.0
+    pixels_per_unit: 500.0
+    depth_priority_far: false
+    origin_mode: "mean"
+    output_file: "/home/jack/ros2_ws/output"
+    input_file: "/home/jack/ros2_ws/project_hj_v2/241108_converted - Cloud.ply"
