@@ -7,7 +7,6 @@
 #include <pcl/io/ply_io.h>
 #include <pcl/point_types.h>
 #include <pcl/conversions.h>
-#include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <Eigen/Dense>
 #include <opencv2/opencv.hpp>
@@ -42,10 +41,6 @@ public:
     this->declare_parameter("point_size", 1);
     this->declare_parameter("publish_rate_hz", 10.0);
     this->declare_parameter("raster_mode", "baseline");
-    this->declare_parameter("enable_downsample", false);
-    this->declare_parameter("voxel_leaf_size", 0.01);
-    this->declare_parameter("use_downsample_for_projection", true);
-    this->declare_parameter("publish_downsample_cloud", true);
     this->declare_parameter("up_hint_x", std::nan(""));
     this->declare_parameter("up_hint_y", std::nan(""));
     this->declare_parameter("up_hint_z", std::nan(""));
@@ -65,12 +60,6 @@ public:
     point_size_ = this->get_parameter("point_size").as_int();
     publish_rate_hz_ = this->get_parameter("publish_rate_hz").as_double();
     raster_mode_ = this->get_parameter("raster_mode").as_string();
-    enable_downsample_ = this->get_parameter("enable_downsample").as_bool();
-    voxel_leaf_size_ = this->get_parameter("voxel_leaf_size").as_double();
-    use_downsample_for_projection_ =
-        this->get_parameter("use_downsample_for_projection").as_bool();
-    publish_downsample_cloud_ =
-        this->get_parameter("publish_downsample_cloud").as_bool();
     save_png_path_ = this->get_parameter("save_png_path").as_string();
 
     // Get up_hint if provided
@@ -88,11 +77,6 @@ public:
     // Create publishers
     pub_cloud_raw_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "/projection/cloud_raw", rclcpp::QoS(1).transient_local());
-
-    if (publish_downsample_cloud_) {
-      pub_cloud_render_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-          "/projection/cloud_render", rclcpp::QoS(1).transient_local());
-    }
 
     pub_image_ = this->create_publisher<sensor_msgs::msg::Image>(
         "/projection/image", rclcpp::QoS(10));
@@ -124,9 +108,6 @@ public:
 
     // Publish cloud once
     publish_cloud_raw();
-    if (publish_downsample_cloud_) {
-      publish_cloud_render();
-    }
 
     // Create timer for projection updates
     publish_timer_ = this->create_wall_timer(
@@ -167,17 +148,12 @@ private:
   int point_size_;
   double publish_rate_hz_;
   std::string raster_mode_;
-  bool enable_downsample_;
-  double voxel_leaf_size_;
-  bool use_downsample_for_projection_;
-  bool publish_downsample_cloud_;
   std::string save_png_path_;
   std::unique_ptr<Vec3d> user_up_hint_;
 
   // Point cloud data (cached)
   MatX3d cloud_raw_;
   std::vector<cv::Vec3b> colors_raw_;
-  MatX3d cloud_render_;  // Downsampled if enabled
 
   // Current plane
   struct PlaneData {
@@ -204,7 +180,6 @@ private:
 
   // Publishers and subscribers
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud_raw_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud_render_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_plane_;
@@ -241,60 +216,6 @@ private:
       uint8_t b = cloud->points[i].b;
       colors_raw_[i] = cv::Vec3b(b, g, r);
     }
-
-    // Handle downsampling if enabled
-    if (enable_downsample_) {
-      downsample_cloud();
-    } else {
-      cloud_render_ = cloud_raw_;
-    }
-  }
-
-  /**
-   * @brief Downsample point cloud using voxel grid
-   */
-  void downsample_cloud() {
-    // Use PCL voxel grid filter
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_raw_pcl(
-        new pcl::PointCloud<pcl::PointXYZRGB>);
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_downsampled(
-        new pcl::PointCloud<pcl::PointXYZRGB>);
-
-    // Convert Eigen matrix back to PCL for filtering
-    for (int i = 0; i < cloud_raw_.rows(); ++i) {
-      pcl::PointXYZRGB p;
-      p.x = cloud_raw_(i, 0);
-      p.y = cloud_raw_(i, 1);
-      p.z = cloud_raw_(i, 2);
-      p.r = colors_raw_[i][2];
-      p.g = colors_raw_[i][1];
-      p.b = colors_raw_[i][0];
-      cloud_raw_pcl->push_back(p);
-    }
-
-    pcl::VoxelGrid<pcl::PointXYZRGB> vg;
-    vg.setInputCloud(cloud_raw_pcl);
-    vg.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
-    vg.filter(*cloud_downsampled);
-
-    // Convert back to Eigen
-    cloud_render_.resize(cloud_downsampled->size(), 3);
-    std::vector<cv::Vec3b> colors_render(cloud_downsampled->size());
-
-    for (size_t i = 0; i < cloud_downsampled->size(); ++i) {
-      cloud_render_(i, 0) = cloud_downsampled->points[i].x;
-      cloud_render_(i, 1) = cloud_downsampled->points[i].y;
-      cloud_render_(i, 2) = cloud_downsampled->points[i].z;
-
-      uint8_t r = cloud_downsampled->points[i].r;
-      uint8_t g = cloud_downsampled->points[i].g;
-      uint8_t b = cloud_downsampled->points[i].b;
-      colors_render[i] = cv::Vec3b(b, g, r);
-    }
-
-    RCLCPP_INFO(this->get_logger(),
-                "Downsampled cloud: %zu -> %zu points", cloud_raw_.rows(),
-                cloud_render_.rows());
   }
 
   /**
@@ -319,43 +240,6 @@ private:
     msg.header.frame_id = "world";
     msg.header.stamp = this->get_clock()->now();
     pub_cloud_raw_->publish(msg);
-  }
-
-  /**
-   * @brief Publish downsampled point cloud
-   */
-  void publish_cloud_render() {
-    if (!publish_downsample_cloud_) return;
-
-    sensor_msgs::msg::PointCloud2 msg;
-    pcl::PointCloud<pcl::PointXYZRGB> pcl_cloud;
-
-    // Create temporary colors for render cloud
-    std::vector<cv::Vec3b> colors_render(cloud_render_.rows());
-    if (!colors_raw_.empty()) {
-      // Use raw cloud colors if available (simplified)
-      for (size_t i = 0; i < std::min((size_t)cloud_render_.rows(),
-                                      colors_raw_.size());
-           ++i) {
-        colors_render[i] = colors_raw_[i];
-      }
-    }
-
-    for (int i = 0; i < cloud_render_.rows(); ++i) {
-      pcl::PointXYZRGB p;
-      p.x = cloud_render_(i, 0);
-      p.y = cloud_render_(i, 1);
-      p.z = cloud_render_(i, 2);
-      p.r = colors_render[i][2];
-      p.g = colors_render[i][1];
-      p.b = colors_render[i][0];
-      pcl_cloud.push_back(p);
-    }
-
-    pcl::toROSMsg(pcl_cloud, msg);
-    msg.header.frame_id = "world";
-    msg.header.stamp = this->get_clock()->now();
-    pub_cloud_render_->publish(msg);
   }
 
   /**
@@ -468,14 +352,9 @@ private:
       // Build basis
       auto [t1, t2] = build_basis(n_hat, up_hint);
 
-      // Select cloud for projection
-      const MatX3d& cloud =
-          (enable_downsample_ && use_downsample_for_projection_) ? cloud_render_
-                                                                  : cloud_raw_;
-      const std::vector<cv::Vec3b>& colors =
-          (enable_downsample_ && use_downsample_for_projection_)
-              ? std::vector<cv::Vec3b>()
-              : colors_raw_;
+      // Use raw cloud for projection
+      const MatX3d& cloud = cloud_raw_;
+      const std::vector<cv::Vec3b>& colors = colors_raw_;
 
       // Project points
       MatX3d cloud_proj = project_points(cloud, n, plane.d);

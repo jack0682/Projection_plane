@@ -27,12 +27,6 @@
     # Publishing
     publish_rate_hz: 10.0  # Rate at which to publish projection images
 
-    # Downsampling (Phase 3 optional)
-    enable_downsample: false      # Enable voxel grid downsampling
-    voxel_leaf_size: 0.01         # Voxel size for downsampling (meters)
-    use_downsample_for_projection: true  # Use downsampled cloud for projection
-    publish_downsample_cloud: true       # Publish downsampled cloud as /projection/cloud_render
-
     # Up hint for basis construction (optional)
     # Set all three to define custom up hint, or leave as NaN for automatic
     up_hint_x: 0.0  # NaN to disable
