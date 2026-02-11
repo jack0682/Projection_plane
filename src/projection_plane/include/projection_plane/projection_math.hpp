@@ -1,11 +1,11 @@
 #pragma once
 
 #include <Eigen/Dense>
-#include <vector>
-#include <cmath>
-#include <stdexcept>
 #include <algorithm>
+#include <cmath>
 #include <rclcpp/rclcpp.hpp>
+#include <stdexcept>
+#include <vector>
 
 namespace projection_plane {
 
@@ -21,11 +21,11 @@ using Vec3i = Eigen::Vector3i;
  * @return Unit vector
  * @throws std::runtime_error if norm is near zero
  */
-inline Vec3d normalize(const Vec3d& v) {
+inline Vec3d normalize(const Vec3d &v) {
   double norm = v.norm();
   if (norm < 1e-12) {
     throw std::runtime_error("Cannot normalize near-zero vector: norm=" +
-                            std::to_string(norm));
+                             std::to_string(norm));
   }
   return v / norm;
 }
@@ -52,8 +52,8 @@ inline Vec3d validate_plane(double a, double b, double c, double /* d */) {
  * @param user_up_hint Optional user-specified up hint
  * @return Appropriate up_hint vector
  */
-inline Vec3d choose_up_hint(const Vec3d& n_hat,
-                            const Vec3d* user_up_hint = nullptr) {
+inline Vec3d choose_up_hint(const Vec3d &n_hat,
+                            const Vec3d *user_up_hint = nullptr) {
   if (user_up_hint != nullptr) {
     Vec3d up = *user_up_hint;
     double up_norm = up.norm();
@@ -66,13 +66,10 @@ inline Vec3d choose_up_hint(const Vec3d& n_hat,
   }
 
   // Default candidates: (0,0,1), (0,1,0), (1,0,0)
-  std::vector<Vec3d> candidates = {
-      Vec3d(0.0, 0.0, 1.0),
-      Vec3d(0.0, 1.0, 0.0),
-      Vec3d(1.0, 0.0, 0.0)
-  };
+  std::vector<Vec3d> candidates = {Vec3d(0.0, 0.0, 1.0), Vec3d(0.0, 1.0, 0.0),
+                                   Vec3d(1.0, 0.0, 0.0)};
 
-  for (const auto& up : candidates) {
+  for (const auto &up : candidates) {
     if (std::abs(n_hat.dot(up)) < 0.95) {
       return up;
     }
@@ -89,8 +86,8 @@ inline Vec3d choose_up_hint(const Vec3d& n_hat,
  * @return Tuple (t1, t2) orthonormal vectors on the plane
  * @throws std::runtime_error if basis construction fails
  */
-inline std::pair<Vec3d, Vec3d> build_basis(const Vec3d& n_hat,
-                                           const Vec3d& up_hint) {
+inline std::pair<Vec3d, Vec3d> build_basis(const Vec3d &n_hat,
+                                           const Vec3d &up_hint) {
   // t1 = normalize(cross(n_hat, up_hint))
   Vec3d t1 = n_hat.cross(up_hint);
   double t1_norm = t1.norm();
@@ -108,6 +105,14 @@ inline std::pair<Vec3d, Vec3d> build_basis(const Vec3d& n_hat,
   }
   t2 = t2 / t2_norm;
 
+  // Direction correction: ensure t2 aligns with up_hint
+  // Without this, cross(n_hat, t1) can produce -Z even when up_hint is +Z,
+  // causing the image to appear flipped 180 degrees.
+  if (t2.dot(up_hint) < 0) {
+    t2 = -t2;
+    t1 = -t1; // flip t1 too to maintain right-hand consistency
+  }
+
   return {t1, t2};
 }
 
@@ -119,8 +124,8 @@ inline std::pair<Vec3d, Vec3d> build_basis(const Vec3d& n_hat,
  * @param d Plane equation constant
  * @return (N, 3) array of projected points
  */
-inline MatX3d project_points(const MatX3d& points, const Vec3d& n, double d) {
-  double n_sq = n.dot(n);  // ||n||^2
+inline MatX3d project_points(const MatX3d &points, const Vec3d &n, double d) {
+  double n_sq = n.dot(n); // ||n||^2
 
   // Signed distance to plane: n·p + d for each point
   VecXd distances = points * n + VecXd::Constant(points.rows(), d);
@@ -142,13 +147,13 @@ inline MatX3d project_points(const MatX3d& points, const Vec3d& n, double d) {
  * @param mode 'mean' or 'closest'
  * @return Origin point on plane
  */
-inline Vec3d compute_origin(const MatX3d& points_proj, const Vec3d& n,
-                           double d, const std::string& mode) {
+inline Vec3d compute_origin(const MatX3d &points_proj, const Vec3d &n, double d,
+                            const std::string &mode) {
   if (mode == "closest") {
     // Closest point on plane to world origin: -(d / ||n||^2) * n
     double n_sq = n.dot(n);
     return -(d / n_sq) * n;
-  } else {  // 'mean'
+  } else { // 'mean'
     return points_proj.colwise().mean();
   }
 }
@@ -160,16 +165,16 @@ inline Vec3d compute_origin(const MatX3d& points_proj, const Vec3d& n,
  * @param t1, t2 Basis vectors
  * @return Pair (u, v) where each is (N,) array
  */
-inline std::pair<VecXd, VecXd> map_uv(const MatX3d& points_proj,
-                                      const Vec3d& origin,
-                                      const Vec3d& t1,
-                                      const Vec3d& t2) {
+inline std::pair<VecXd, VecXd> map_uv(const MatX3d &points_proj,
+                                      const Vec3d &origin, const Vec3d &t1,
+                                      const Vec3d &t2) {
   // Relative positions: rel = p_proj - origin
   int n = points_proj.rows();
   VecXd u(n), v(n);
 
   for (int i = 0; i < n; ++i) {
-    Vec3d point = points_proj.row(i).transpose();  // Convert row to column vector
+    Vec3d point =
+        points_proj.row(i).transpose(); // Convert row to column vector
     Vec3d rel = point - origin;
     u(i) = rel.dot(t1);
     v(i) = rel.dot(t2);
@@ -187,14 +192,14 @@ inline std::pair<VecXd, VecXd> map_uv(const MatX3d& points_proj,
  * @param mode 'abs' or 'signed'
  * @return (N,) array of depth values
  */
-inline VecXd compute_depth(const MatX3d& points, const Vec3d& n,
-                          double d, const std::string& mode) {
+inline VecXd compute_depth(const MatX3d &points, const Vec3d &n, double d,
+                           const std::string &mode) {
   double n_norm = n.norm();
   VecXd signed_dist = (points * n + VecXd::Constant(points.rows(), d)) / n_norm;
 
   if (mode == "abs") {
     return signed_dist.cwiseAbs();
-  } else {  // 'signed'
+  } else { // 'signed'
     return signed_dist;
   }
 }
@@ -209,18 +214,15 @@ inline VecXd compute_depth(const MatX3d& points, const Vec3d& n,
  * @return Tuple (width, height, u_min, u_max, v_min, v_max)
  */
 inline std::tuple<int, int, double, double, double, double>
-compute_image_size(const VecXd& u, const VecXd& v,
-                   double pixels_per_unit,
-                   int width_override = -1,
-                   int height_override = -1,
-                   bool robust_range = false,
-                   double percentile_low = 1.0,
+compute_image_size(const VecXd &u, const VecXd &v, double pixels_per_unit,
+                   int width_override = -1, int height_override = -1,
+                   bool robust_range = false, double percentile_low = 1.0,
                    double percentile_high = 99.0) {
   double u_min, u_max, v_min, v_max;
 
   if (robust_range) {
     // Compute percentiles
-    auto compute_percentile = [](const VecXd& data, double p) {
+    auto compute_percentile = [](const VecXd &data, double p) {
       int n = data.size();
       std::vector<double> sorted(data.data(), data.data() + n);
       std::sort(sorted.begin(), sorted.end());
@@ -244,8 +246,10 @@ compute_image_size(const VecXd& u, const VecXd& v,
   double v_range = v_max - v_min;
 
   // Handle degenerate cases
-  if (u_range < 1e-9) u_range = 1.0;
-  if (v_range < 1e-9) v_range = 1.0;
+  if (u_range < 1e-9)
+    u_range = 1.0;
+  if (v_range < 1e-9)
+    v_range = 1.0;
 
   int auto_width = static_cast<int>(std::ceil(u_range * pixels_per_unit)) + 1;
   int auto_height = static_cast<int>(std::ceil(v_range * pixels_per_unit)) + 1;
@@ -276,4 +280,4 @@ inline int32_t round_to_int32(double x) {
   return static_cast<int32_t>(bankers_round(x));
 }
 
-}  // namespace projection_plane
+} // namespace projection_plane
