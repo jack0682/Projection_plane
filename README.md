@@ -702,6 +702,10 @@ Jack <jack0682@github.com>
 
 projection_sam3는 projection_plane에서 생성된 이미지를 입력받아 **SAM3 (Segment Anything Model 3)** 을 사용한 **텍스트 기반 시맨틱 분할**을 수행하는 ROS2 노드입니다.
 
+### Demo image
+<img width="1550" height="461" alt="image" src="https://github.com/user-attachments/assets/b2d1e88f-4fdb-41e6-b128-644a39e48f78" />
+
+
 ### 주요 특징
 - ✅ **Text-based segmentation**: "box", "magazine" 등 텍스트 프롬프트로 객체 분할
 - ✅ **Real-time processing**: 1088x1088 해상도에서 ~40ms 추론
