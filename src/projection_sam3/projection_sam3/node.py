@@ -85,7 +85,7 @@ class ProjectionSAM3Node(Node):
 
         try:
             overrides = dict(
-                conf=0.25,
+                conf=0.5, # 확률 임계값
                 task="segment",
                 mode="predict",
                 model=self.model_path,
