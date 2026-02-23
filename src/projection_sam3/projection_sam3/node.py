@@ -38,7 +38,7 @@ class ProjectionSAM3Node(Node):
         self.declare_parameter('model_path', '/home/jack/ros2_ws/sam_3d_test/models/sam3.pt')
         self.declare_parameter('max_fps', 2.0)
         self.declare_parameter('conf_rack', 0.3)
-        self.declare_parameter('conf_obj', 0.75)
+        self.declare_parameter('conf_obj', 0.7)
         self.declare_parameter('scale_factor', 2.0)
         self.declare_parameter('crop_padding', 50)
 
@@ -67,6 +67,10 @@ class ProjectionSAM3Node(Node):
         self.latest_image_header = None
         self.image_lock = threading.Lock()
         self.new_image_event = threading.Event()
+
+        # Mask buffer for Phase 5 (6DOF node)
+        self.latest_masks = []
+        self.masks_lock = threading.Lock()
 
         # Create publishers
         qos = QoSProfile(
@@ -247,6 +251,36 @@ class ProjectionSAM3Node(Node):
                     else:
                         masks_data = np.asarray(masks_data)
 
+                    # ── PHASE 1: Extract pixel-wise confidence maps ──
+                    confidence_maps = None
+                    try:
+                        # Option 1: Try to get probability maps (preferred)
+                        if hasattr(res_obj.masks, 'probs') and res_obj.masks.probs is not None:
+                            confidence_maps = res_obj.masks.probs
+                            if hasattr(confidence_maps, 'cpu'):
+                                confidence_maps = confidence_maps.cpu().numpy()
+                            else:
+                                confidence_maps = np.asarray(confidence_maps)
+                            self.get_logger().debug(f'[PHASE1] Extracted masks.probs: shape {confidence_maps.shape}')
+
+                        # Option 2: Try to convert logits to probabilities
+                        elif hasattr(res_obj.masks, 'logits') and res_obj.masks.logits is not None:
+                            import torch
+                            logits = res_obj.masks.logits
+                            if hasattr(logits, 'cpu'):
+                                logits = logits.cpu()
+                            # Apply softmax across the first dimension
+                            confidence_maps = torch.nn.functional.softmax(logits, dim=0).numpy()
+                            self.get_logger().debug(f'[PHASE1] Extracted masks.logits + softmax: shape {confidence_maps.shape}')
+
+                        # Fallback: Use uniform confidence
+                        if confidence_maps is None:
+                            self.get_logger().debug('[PHASE1] No pixel-wise confidence available, will use uniform weights')
+
+                    except Exception as e:
+                        self.get_logger().warn(f'[PHASE1] Error extracting confidence maps: {e}')
+                        confidence_maps = None
+
                     # Get confidence and class info
                     conf_data = None
                     cls_data = None
@@ -269,7 +303,17 @@ class ProjectionSAM3Node(Node):
                     for mask_idx, mask in enumerate(masks_data):
                         n_total += 1
 
-                        # Confidence check
+                        # Store mask and confidence for Phase 2 usage
+                        # (will be used in mask_analysis.py for weighted center calculation)
+                        mask_confidence_map = None
+                        if confidence_maps is not None:
+                            try:
+                                if len(confidence_maps.shape) == 3:  # (n_det, H, W)
+                                    mask_confidence_map = confidence_maps[mask_idx]  # (H, W)
+                            except Exception as e:
+                                self.get_logger().debug(f'Could not extract confidence map for mask {mask_idx}: {e}')
+
+                        # Confidence check (using per-detection confidence)
                         conf = 1.0
                         if conf_data is not None and len(conf_data) > mask_idx:
                             conf = float(conf_data[mask_idx])
@@ -318,11 +362,33 @@ class ProjectionSAM3Node(Node):
                         hyp.hypothesis.score = float(conf)
                         det.results.append(hyp)
 
+                        # Debug: Log if confidence map available for this detection
+                        if mask_confidence_map is not None:
+                            conf_map_mean = np.mean(mask_confidence_map)
+                            self.get_logger().debug(
+                                f'[PHASE1] Detection {mask_idx}: confidence_map shape {mask_confidence_map.shape}, mean={conf_map_mean:.3f}'
+                            )
+
                         detections_list.append(det)
+
+                        # Store mask for Phase 5 (6DOF node)
+                        # Mask will be accessed by detection index
+                        with self.masks_lock:
+                            self.latest_masks.append(mask.astype(bool))
 
             self.get_logger().info(
                 f'Stage2: {n_valid}/{n_total} objects (conf>={self.conf_obj})'
             )
+
+            # PHASE 1 Status Summary
+            if confidence_maps is not None:
+                self.get_logger().info(
+                    f'[PHASE1] ✓ Confidence maps extracted: shape {confidence_maps.shape}'
+                )
+            else:
+                self.get_logger().info(
+                    f'[PHASE1] Confidence maps not available - will use uniform weights in Phase 2'
+                )
 
         except Exception as e:
             self.get_logger().error(f'SAM3 inference error: {e}')
@@ -331,6 +397,11 @@ class ProjectionSAM3Node(Node):
         detection_array = Detection2DArray()
         detection_array.header = header
         detection_array.detections = detections_list
+
+        # Store masks in sync with detections (for Phase 5/6DOF node)
+        with self.masks_lock:
+            self.latest_masks = getattr(self, 'current_batch_masks', [])
+
         self.pub_detections.publish(detection_array)
 
         debug_msg = String()

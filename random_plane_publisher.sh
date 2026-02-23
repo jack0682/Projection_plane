@@ -13,13 +13,27 @@ count=0
 while true; do
   count=$((count + 1))
 
-  # awk를 사용한 랜덤 값 생성
+  # 가우시안 노이즈로 [1, 0, 0, 1] 근처의 약간 틀어진 평면 생성
+  # sigma_n: 법선 벡터 흔들림 (작을수록 [1,0,0]에 가까움)
+  # sigma_d: 거리 d 흔들림
   read a b c d < <(awk 'BEGIN {
     srand();
-    a = int(rand() * 200 - 100) / 100.0;
-    b = int(rand() * 200 - 100) / 100.0;
-    c = int(rand() * 200 - 100) / 100.0;
-    d = int(rand() * 400 - 200) / 100.0;
+    sigma_n = 0.05;
+    sigma_d = 0.1;
+    # Box-Muller transform for Gaussian noise
+    u1 = rand(); u2 = rand();
+    g1 = sqrt(-2*log(u1)) * cos(2*3.14159265*u2);
+    g2 = sqrt(-2*log(u1)) * sin(2*3.14159265*u2);
+    u3 = rand(); u4 = rand();
+    g3 = sqrt(-2*log(u3)) * cos(2*3.14159265*u4);
+    g4 = sqrt(-2*log(u3)) * sin(2*3.14159265*u4);
+    a = 1.0 + sigma_n * g1;
+    b = 0.0 + sigma_n * g2;
+    c = 0.0 + sigma_n * g3;
+    d = 1.0 + sigma_d * g4;
+    # normalize normal vector
+    len = sqrt(a*a + b*b + c*c);
+    a = a / len; b = b / len; c = c / len;
     printf "%.4f %.4f %.4f %.4f", a, b, c, d;
   }')
 

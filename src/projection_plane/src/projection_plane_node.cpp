@@ -84,6 +84,9 @@ public:
     pub_pose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
         "/projection/camera_pose", rclcpp::QoS(10));
 
+    pub_meta_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+        "/projection/proj_meta", rclcpp::QoS(10));
+
     // Create subscriptions
     sub_plane_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
         "/projection/plane", rclcpp::QoS(10),
@@ -182,6 +185,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud_raw_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_meta_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_plane_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_pose_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
@@ -384,6 +388,44 @@ private:
         std::lock_guard<std::mutex> lock(image_mutex_);
         last_image_ = image;
       }
+
+      // Publish projection metadata for tracker
+      // Format: [width, height,
+      //          a, b, c, d,
+      //          origin_x, origin_y, origin_z,
+      //          t1_x, t1_y, t1_z,
+      //          t2_x, t2_y, t2_z,
+      //          u_min, u_max, v_min, v_max,
+      //          stamp_sec, stamp_nanosec]
+      std_msgs::msg::Float64MultiArray meta_msg;
+      meta_msg.data.resize(20);
+      meta_msg.data[0] = static_cast<double>(width);
+      meta_msg.data[1] = static_cast<double>(height);
+      meta_msg.data[2] = plane.a;
+      meta_msg.data[3] = plane.b;
+      meta_msg.data[4] = plane.c;
+      meta_msg.data[5] = plane.d;
+      meta_msg.data[6] = origin(0);
+      meta_msg.data[7] = origin(1);
+      meta_msg.data[8] = origin(2);
+      meta_msg.data[9] = t1(0);
+      meta_msg.data[10] = t1(1);
+      meta_msg.data[11] = t1(2);
+      meta_msg.data[12] = t2(0);
+      meta_msg.data[13] = t2(1);
+      meta_msg.data[14] = t2(2);
+      meta_msg.data[15] = u_min;
+      meta_msg.data[16] = u_max;
+      meta_msg.data[17] = v_min;
+      meta_msg.data[18] = v_max;
+
+      // Timestamp
+      auto now = this->get_clock()->now();
+      meta_msg.data[19] = static_cast<double>(now.seconds());
+      // Note: nanosec is stored as second element in geometry_utils.py extract_metadata
+      // For now we pack both into the data array
+
+      pub_meta_->publish(meta_msg);
 
       RCLCPP_DEBUG(this->get_logger(),
                    "Projection complete: plane=[%.3f,%.3f,%.3f,%.3f] "
