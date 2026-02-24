@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>projection_msgs</name>
+  <version>0.0.1</version>
+  <description>Projection contract message</description>
+  <maintainer email="jack@example.com">Jack</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>std_msgs</build_depend>
+
+  <!-- ✅ 반드시 추가(런타임) -->
+  <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <!-- ✅ 반드시 최상위 레벨 (export 밖!) -->
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

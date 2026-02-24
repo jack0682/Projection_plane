@@ -3,6 +3,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <projection_msgs/msg/projection_contract.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <pcl/io/ply_io.h>
 #include <pcl/point_types.h>
@@ -46,6 +47,13 @@ public:
     this->declare_parameter("up_hint_z", std::nan(""));
     this->declare_parameter("save_png_path", "");
 
+    // FOV geometry parameters
+    this->declare_parameter("hfov_deg", 87.0);           // RealSense D435 horizontal FOV
+    this->declare_parameter("vfov_deg", 58.0);           // RealSense D435 vertical FOV
+    this->declare_parameter("plane_distance_m", 2.0);    // Virtual plane distance from camera
+    this->declare_parameter("lock_yaw", true);           // Lock yaw to camera x-axis projection
+    this->declare_parameter("imgsz_px", 1092);           // Fixed image size (must be 1092)
+
     // Get parameters
     ply_path_ = this->get_parameter("ply_path").as_string();
     pixels_per_unit_ = this->get_parameter("pixels_per_unit").as_double();
@@ -61,6 +69,34 @@ public:
     publish_rate_hz_ = this->get_parameter("publish_rate_hz").as_double();
     raster_mode_ = this->get_parameter("raster_mode").as_string();
     save_png_path_ = this->get_parameter("save_png_path").as_string();
+
+    // Load FOV parameters
+    hfov_deg_ = this->get_parameter("hfov_deg").as_double();
+    vfov_deg_ = this->get_parameter("vfov_deg").as_double();
+    plane_distance_m_ = this->get_parameter("plane_distance_m").as_double();
+    lock_yaw_ = this->get_parameter("lock_yaw").as_bool();
+    imgsz_px_ = this->get_parameter("imgsz_px").as_int();
+
+    RCLCPP_INFO(this->get_logger(),
+        "FOV: H=%.1f° V=%.1f°, dist=%.2fm, imgsz=%d, lock_yaw=%s",
+        hfov_deg_, vfov_deg_, plane_distance_m_, imgsz_px_,
+        lock_yaw_ ? "true" : "false");
+
+    // Validate parameters
+    if (hfov_deg_ <= 0.0 || hfov_deg_ > 180.0) {
+        throw std::runtime_error("hfov_deg must be in (0, 180)");
+    }
+    if (vfov_deg_ <= 0.0 || vfov_deg_ > 180.0) {
+        throw std::runtime_error("vfov_deg must be in (0, 180)");
+    }
+    if (plane_distance_m_ <= 0.0) {
+        throw std::runtime_error("plane_distance_m must be > 0");
+    }
+    if (imgsz_px_ != 1092) {
+        RCLCPP_WARN(this->get_logger(),
+            "imgsz_px=%d (expected 1092), forcing 1092", imgsz_px_);
+        imgsz_px_ = 1092;
+    }
 
     // Get up_hint if provided
     double up_hint_x = this->get_parameter("up_hint_x").as_double();
@@ -86,6 +122,9 @@ public:
 
     pub_meta_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
         "/projection/proj_meta", rclcpp::QoS(10));
+
+    pub_contract_ = this->create_publisher<projection_msgs::msg::ProjectionContract>(
+        "/projection/contract", rclcpp::QoS(10));
 
     // Create subscriptions
     sub_plane_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -154,6 +193,29 @@ private:
   std::string save_png_path_;
   std::unique_ptr<Vec3d> user_up_hint_;
 
+  // FOV geometry parameters
+  double hfov_deg_;
+  double vfov_deg_;
+  double plane_distance_m_;
+  bool lock_yaw_;
+  int imgsz_px_;
+
+  // Plane geometry (updated by pose_callback)
+  Vec3d plane_center_;
+  Vec3d plane_normal_;
+  Mat3d camera_rotation_;
+  double plane_width_m_;
+  double plane_height_m_;
+  double sx_px_per_m_;
+  double sy_px_per_m_;
+  double ox_px_;
+  double oy_px_;
+
+  // Basis vectors (u, v, n) for deterministic yaw lock
+  Vec3d basis_u_;
+  Vec3d basis_v_;
+  Vec3d basis_n_;
+
   // Point cloud data (cached)
   MatX3d cloud_raw_;
   std::vector<cv::Vec3b> colors_raw_;
@@ -186,6 +248,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_meta_;
+  rclcpp::Publisher<projection_msgs::msg::ProjectionContract>::SharedPtr pub_contract_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr sub_plane_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_pose_;
   rclcpp::TimerBase::SharedPtr publish_timer_;
@@ -272,8 +335,172 @@ private:
    * @brief Pose subscription callback (relay)
    */
   void pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
-    std::lock_guard<std::mutex> lock(image_mutex_);
-    last_pose_ = *msg;
+    try {
+      // Extract camera position
+      Vec3d C(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+
+      // Extract camera orientation and convert to rotation matrix
+      Eigen::Quaterniond q(
+          msg->pose.orientation.w,
+          msg->pose.orientation.x,
+          msg->pose.orientation.y,
+          msg->pose.orientation.z
+      );
+      Mat3d R = q.toRotationMatrix();
+
+      // Compute plane normal from camera forward (Z-axis)
+      // Convention: camera Z-axis is optical axis (forward)
+      Vec3d n_cam = R.col(2);  // Camera z-axis
+
+      // Validate: plane normal should not be near zero
+      if (n_cam.norm() < 0.99) {
+        RCLCPP_ERROR(this->get_logger(), "Invalid camera rotation matrix");
+        return;
+      }
+
+      // Plane origin: camera position + distance * normal
+      Vec3d P = C + plane_distance_m_ * n_cam;
+
+      // Compute horizontal and vertical physical dimensions from FOV
+      double hfov_rad = hfov_deg_ * M_PI / 180.0;
+      double vfov_rad = vfov_deg_ * M_PI / 180.0;
+      double Wm = 2.0 * plane_distance_m_ * std::tan(hfov_rad / 2.0);
+      double Hm = 2.0 * plane_distance_m_ * std::tan(vfov_rad / 2.0);
+
+      // Store FOV-derived dimensions (will be published in contract)
+      plane_width_m_ = Wm;
+      plane_height_m_ = Hm;
+
+      // Compute scale factors (px/m)
+      sx_px_per_m_ = imgsz_px_ / Wm;
+      sy_px_per_m_ = imgsz_px_ / Hm;
+
+      // Pixel origins (center-based mapping)
+      ox_px_ = imgsz_px_ / 2.0;
+      oy_px_ = imgsz_px_ / 2.0;
+
+      // === DETERMINISTIC YAW LOCK (T2b) ===
+      // Compute orthonormal basis (u, v, n) with camera x-axis projection
+      Vec3d e_x_cam = R.col(0);  // Camera x-axis (right direction)
+
+      // Project camera x-axis onto plane to get u-axis
+      Vec3d u_raw = e_x_cam - (e_x_cam.dot(n_cam)) * n_cam;
+
+      // Handle degenerate case: if camera x-axis is parallel to plane normal
+      double u_raw_norm = u_raw.norm();
+      if (u_raw_norm < 1e-6) {
+        // Fallback 1: Use camera y-axis
+        Vec3d e_y_cam = R.col(1);
+        u_raw = e_y_cam - (e_y_cam.dot(n_cam)) * n_cam;
+        u_raw_norm = u_raw.norm();
+
+        // Fallback 2: Use world up if camera y-axis also fails
+        if (u_raw_norm < 1e-6) {
+          Vec3d world_up(0.0, 0.0, 1.0);
+          u_raw = world_up - (world_up.dot(n_cam)) * n_cam;
+          u_raw_norm = u_raw.norm();
+
+          // Final fallback: arbitrary orthogonal direction
+          if (u_raw_norm < 1e-6) {
+            // Pick orthogonal direction to n_cam
+            if (std::abs(n_cam(0)) < 0.9) {
+              u_raw = Vec3d(1.0, 0.0, 0.0) - (n_cam(0)) * n_cam;
+            } else {
+              u_raw = Vec3d(0.0, 1.0, 0.0) - (n_cam(1)) * n_cam;
+            }
+            u_raw_norm = u_raw.norm();
+          }
+        }
+      }
+
+      // Normalize u-axis
+      Vec3d u = u_raw / u_raw_norm;
+
+      // Compute v-axis via right-hand rule cross product
+      Vec3d v = n_cam.cross(u);
+      v = v.normalized();  // Normalize v-axis
+
+      // Normalize n_cam as well (should already be normalized, but ensure it)
+      Vec3d n = n_cam.normalized();
+
+      // === VALIDATION: Orthonormality checks ===
+      double u_len = u.norm();
+      double v_len = v.norm();
+      double n_len = n.norm();
+      double u_dot_v = u.dot(v);
+      double v_dot_n = v.dot(n);
+      double n_dot_u = n.dot(u);
+
+      bool ortho_valid = (std::abs(u_len - 1.0) < 1e-4) &&
+                         (std::abs(v_len - 1.0) < 1e-4) &&
+                         (std::abs(n_len - 1.0) < 1e-4) &&
+                         (std::abs(u_dot_v) < 1e-4) &&
+                         (std::abs(v_dot_n) < 1e-4) &&
+                         (std::abs(n_dot_u) < 1e-4);
+
+      // Ensure right-handedness: u × v = n
+      Vec3d u_cross_v = u.cross(v);
+      double rh_check = u_cross_v.dot(n);  // Should be ≈ 1.0
+      bool right_handed = rh_check > 0.99;
+
+      if (!ortho_valid || !right_handed) {
+        RCLCPP_WARN(this->get_logger(),
+            "Basis orthonormality check failed: |u|=%.4f, |v|=%.4f, |n|=%.4f, "
+            "u·v=%.6f, v·n=%.6f, n·u=%.6f, u×v·n=%.4f",
+            u_len, v_len, n_len, u_dot_v, v_dot_n, n_dot_u, rh_check);
+      }
+
+      // Store basis vectors
+      basis_u_ = u;
+      basis_v_ = v;
+      basis_n_ = n;
+
+      RCLCPP_DEBUG(this->get_logger(),
+          "Basis locked: u=[%.4f,%.4f,%.4f], v=[%.4f,%.4f,%.4f], "
+          "n=[%.4f,%.4f,%.4f] (ortho check: %.4f, RH: %.4f)",
+          u(0), u(1), u(2), v(0), v(1), v(2), n(0), n(1), n(2),
+          u_dot_v, rh_check);
+
+      // Signal worker thread to recompute projection
+      {
+        std::lock_guard<std::mutex> lock(plane_mutex_);
+        plane_center_ = P;
+        plane_normal_ = n_cam;  // Will compute u, v in worker
+        camera_rotation_ = R;   // Store for yaw lock computation
+        plane_updated_ = true;
+      }
+
+      // Also update pending_plane for worker_loop (worker_mutex_)
+      // Compute plane equation from calculated normal and center
+      double a = n_cam(0);
+      double b = n_cam(1);
+      double c = n_cam(2);
+      double d = -(n_cam.dot(P));  // d = -(n · P)
+      {
+        std::lock_guard<std::mutex> lock(worker_mutex_);
+        pending_plane_.a = a;
+        pending_plane_.b = b;
+        pending_plane_.c = c;
+        pending_plane_.d = d;
+        pending_plane_available_ = true;
+      }
+      cv_worker_.notify_one();
+
+      RCLCPP_DEBUG(this->get_logger(),
+          "Pose→Plane: P=[%.2f,%.2f,%.2f], n=[%.3f,%.3f,%.3f], "
+          "FOV=%.1f°x%.1f°, Wm=%.2f, Hm=%.2f",
+          P(0), P(1), P(2), n_cam(0), n_cam(1), n_cam(2),
+          hfov_deg_, vfov_deg_, Wm, Hm);
+
+      // Also store pose for other uses
+      {
+        std::lock_guard<std::mutex> lock(image_mutex_);
+        last_pose_ = *msg;
+      }
+
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "pose_callback error: %s", e.what());
+    }
   }
 
   /**
@@ -372,10 +599,15 @@ private:
       // Compute depth
       VecXd depth = compute_depth(cloud, n, plane.d, depth_mode_);
 
-      // Compute image size
-      auto [width, height, u_min, u_max, v_min, v_max] = compute_image_size(
+      // Compute image size (for metadata and bounds)
+      auto [width_computed, height_computed, u_min, u_max, v_min, v_max] = compute_image_size(
           u, v, pixels_per_unit_, width_override_, height_override_,
           robust_range_, percentile_low_, percentile_high_);
+
+      // === FORCE 1092×1092 OUTPUT (T3) ===
+      // Override computed size to always output 1092×1092 px
+      int width = imgsz_px_;      // Always 1092 (enforced in constructor)
+      int height = imgsz_px_;     // Always 1092 (enforced in constructor)
 
       // Rasterize
       cv::Mat image = rasterize(u, v, depth, colors, width, height, u_min,
@@ -426,6 +658,61 @@ private:
       // For now we pack both into the data array
 
       pub_meta_->publish(meta_msg);
+
+      // === PUBLISH PROJECTION CONTRACT (T5) ===
+      // Sync contract with image using values from pose_callback
+      {
+        std::lock_guard<std::mutex> lock(plane_mutex_);
+
+        projection_msgs::msg::ProjectionContract contract_msg;
+
+        // Header with timestamp
+        contract_msg.header.stamp = now;
+        contract_msg.header.frame_id = "world";
+
+        // Plane geometry (from pose_callback via T2b)
+        contract_msg.plane_center.x = plane_center_(0);
+        contract_msg.plane_center.y = plane_center_(1);
+        contract_msg.plane_center.z = plane_center_(2);
+
+        // Basis vectors (from T2b yaw lock computation)
+        contract_msg.basis_u.x = basis_u_(0);
+        contract_msg.basis_u.y = basis_u_(1);
+        contract_msg.basis_u.z = basis_u_(2);
+
+        contract_msg.basis_v.x = basis_v_(0);
+        contract_msg.basis_v.y = basis_v_(1);
+        contract_msg.basis_v.z = basis_v_(2);
+
+        contract_msg.basis_n.x = basis_n_(0);
+        contract_msg.basis_n.y = basis_n_(1);
+        contract_msg.basis_n.z = basis_n_(2);
+
+        // Plane dimensions (from T2 FOV computation)
+        contract_msg.plane_width_m = plane_width_m_;
+        contract_msg.plane_height_m = plane_height_m_;
+
+        // Image size (fixed 1092×1092 from T3)
+        contract_msg.image_width_px = static_cast<uint32_t>(width);
+        contract_msg.image_height_px = static_cast<uint32_t>(height);
+
+        // Scale factors and pixel origins (from T2)
+        contract_msg.sx_px_per_m = sx_px_per_m_;
+        contract_msg.sy_px_per_m = sy_px_per_m_;
+        contract_msg.ox_px = ox_px_;
+        contract_msg.oy_px = oy_px_;
+
+        // Pixel convention: center-based (0,0) at image center
+        contract_msg.pixel_convention = "center";
+
+        pub_contract_->publish(contract_msg);
+
+        RCLCPP_DEBUG(this->get_logger(),
+            "Contract published: center=[%.2f,%.2f,%.2f], "
+            "dims=%.2fx%.2fm, scale=%.1fx%.1f px/m",
+            plane_center_(0), plane_center_(1), plane_center_(2),
+            plane_width_m_, plane_height_m_, sx_px_per_m_, sy_px_per_m_);
+      }
 
       RCLCPP_DEBUG(this->get_logger(),
                    "Projection complete: plane=[%.3f,%.3f,%.3f,%.3f] "

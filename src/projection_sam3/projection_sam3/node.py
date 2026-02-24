@@ -28,7 +28,7 @@ except ImportError:
 
 class ProjectionSAM3Node(Node):
     """ROS2 node for SAM3 semantic segmentation.
-    Two-Stage Inference: Rack Detection → Crop → Upscale → Object Detection.
+    Two-Stage Inference: Rack Detection → Crop → Object Detection.
     """
 
     def __init__(self):
@@ -39,7 +39,6 @@ class ProjectionSAM3Node(Node):
         self.declare_parameter('max_fps', 2.0)
         self.declare_parameter('conf_rack', 0.3)
         self.declare_parameter('conf_obj', 0.7)
-        self.declare_parameter('scale_factor', 2.0)
         self.declare_parameter('crop_padding', 50)
 
         # Get parameters
@@ -47,7 +46,6 @@ class ProjectionSAM3Node(Node):
         self.max_fps = self.get_parameter('max_fps').value
         self.conf_rack = self.get_parameter('conf_rack').value
         self.conf_obj = self.get_parameter('conf_obj').value
-        self.scale_factor = self.get_parameter('scale_factor').value
         self.crop_padding = self.get_parameter('crop_padding').value
 
         # CSV 저장을 위한 코드 (runs/segment/predictN 에 저장)
@@ -100,7 +98,7 @@ class ProjectionSAM3Node(Node):
         self.get_logger().info(
             f'ProjectionSAM3Node initialized '
             f'(conf_rack={self.conf_rack}, conf_obj={self.conf_obj}, '
-            f'scale={self.scale_factor}, pad={self.crop_padding})'
+            f'pad={self.crop_padding})'
         )
 
     def _init_model(self):
@@ -118,7 +116,7 @@ class ProjectionSAM3Node(Node):
                 model=self.model_path,
                 half=True,
                 save=False,  # Rack 결과는 저장하지 않음
-                imgsz=1088,
+                imgsz=1092,
             )
             self.predictor_rack = SAM3SemanticPredictor(overrides=overrides_rack)
             self.get_logger().info(f'Stage1 predictor loaded (conf={self.conf_rack})')
@@ -131,7 +129,7 @@ class ProjectionSAM3Node(Node):
                 model=self.model_path,
                 half=True,
                 save=True,
-                imgsz=1088,
+                imgsz=1092,
             )
             self.predictor_obj = SAM3SemanticPredictor(overrides=overrides_obj)
             self.get_logger().info(f'Stage2 predictor loaded (conf={self.conf_obj})')
@@ -179,7 +177,7 @@ class ProjectionSAM3Node(Node):
                 self.get_logger().error(f'Inference error: {e}')
 
     def _run_inference(self, image_cv, header):
-        """Two-Stage Inference: Rack → Crop → Upscale → Object Detection."""
+        """Two-Stage Inference: Rack → Crop → Object Detection."""
         if self.predictor_rack is None or self.predictor_obj is None:
             return
 
@@ -223,10 +221,7 @@ class ProjectionSAM3Node(Node):
                     f'Stage1: {n_rack_masks} rack masks -> ROI ({x0},{y0})->({x1},{y1})'
                 )
 
-                crop_img = image_rgb[y0:y1, x0:x1]
-                h_c, w_c = crop_img.shape[:2]
-                new_size = (int(w_c * self.scale_factor), int(h_c * self.scale_factor))
-                infer_img = cv2.resize(crop_img, new_size, interpolation=cv2.INTER_CUBIC)
+                infer_img = image_rgb[y0:y1, x0:x1]
                 use_crop = True
             else:
                 self.get_logger().warn('Stage1: No rack found -> Fallback to full image')
@@ -342,11 +337,10 @@ class ProjectionSAM3Node(Node):
 
                         # ── Coordinate Restoration ──
                         if use_crop:
-                            sf = self.scale_factor
-                            xmin_orig = (xmin / sf) + x0
-                            xmax_orig = (xmax / sf) + x0
-                            ymin_orig = (ymin / sf) + y0
-                            ymax_orig = (ymax / sf) + y0
+                            xmin_orig = xmin + x0
+                            xmax_orig = xmax + x0
+                            ymin_orig = ymin + y0
+                            ymax_orig = ymax + y0
                         else:
                             xmin_orig, xmax_orig = xmin, xmax
                             ymin_orig, ymax_orig = ymin, ymax

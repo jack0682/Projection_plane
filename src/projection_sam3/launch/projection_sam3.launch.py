@@ -31,6 +31,9 @@ def generate_launch_description():
         parameters=[
             {'model_path': LaunchConfiguration('model_path')},
             {'max_fps': LaunchConfiguration('max_fps')},
+            {'conf_rack': 0.3},
+            {'conf_obj': 0.7},
+            {'crop_padding': 50},
         ],
         output='screen',
     )

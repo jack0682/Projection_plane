@@ -1,0 +1,14 @@
+std_msgs/Header header
+geometry_msgs/Point plane_center
+geometry_msgs/Vector3 basis_u
+geometry_msgs/Vector3 basis_v
+geometry_msgs/Vector3 basis_n
+float64 plane_width_m
+float64 plane_height_m
+uint32 image_width_px
+uint32 image_height_px
+float64 sx_px_per_m
+float64 sy_px_per_m
+float64 ox_px
+float64 oy_px
+string pixel_convention

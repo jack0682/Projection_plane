@@ -22,6 +22,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(projection_msgs REQUIRED)
 
 # Include directories
 include_directories(include)
@@ -48,6 +49,7 @@ ament_target_dependencies(projection_plane_node
   pcl_ros
   Eigen3
   OpenCV
+  projection_msgs
 )
 
 target_link_libraries(projection_plane_node
