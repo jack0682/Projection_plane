@@ -10,10 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', [
-            'launch/projection_sam3.launch.py',
-            'launch/box_6dof.launch.py',
-        ]),
+        ('share/' + package_name + '/launch', ['launch/projection_sam3.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,8 +26,6 @@ setup(
     entry_points={
         'console_scripts': [
             'projection_sam3_node = projection_sam3.node:main',
-            'projection_sam3_tracker_node = projection_sam3.tracker_node:main',
-            'box_6dof_node = projection_sam3.box_6dof_node:main',
         ],
     },
 )
