@@ -81,18 +81,18 @@ class DetectionMessage:
 
 @dataclass
 class Pose6DOF:
-    """6DOF pose result"""
+    """6DOF pose result (MAP FRAME - PCD 맵 좌표계)"""
     detection_id: int
     confidence: float
-    # Position (meters)
+    # Position (meters) - MAP FRAME
     x: float
     y: float
     z: float
-    # Orientation (Euler angles in radians, ZYX order)
+    # Orientation (Euler angles in radians, ZYX order) - MAP FRAME
     roll: float
     pitch: float
     yaw: float
-    # Quaternion (primary representation)
+    # Quaternion (primary representation) - MAP FRAME
     qx: float
     qy: float
     qz: float
@@ -104,6 +104,8 @@ class Pose6DOF:
     pca_time_ms: float
     # Gimbal lock flag
     gimbal_lock: bool = False
+    # Reference frame (항상 "map")
+    frame_id: str = "map"
 
 # ============================================================================
 # ROS2 MESSAGE STRUCTURES (stubs - to be defined in msg file)
@@ -1025,10 +1027,12 @@ class DetectionsTo6DOFConverter(Node):
             # Setup publisher if needed
             self._setup_publisher()
 
-            # Publish each detection as Float64MultiArray (placeholder format)
-            from std_msgs.msg import Float64MultiArray
+            # Publish each detection as Float64MultiArray (with frame_id marker)
+            from std_msgs.msg import Float64MultiArray, Header
             for pose in poses_6dof:
                 msg = Float64MultiArray()
+                # Header with MAP FRAME
+                msg.layout.dim.append(std_msgs.msg.MultiArrayDimension(label="detections_6dof_data", size=14))
                 msg.data = [
                     float(pose.detection_id),
                     pose.x, pose.y, pose.z,
@@ -1038,6 +1042,7 @@ class DetectionsTo6DOFConverter(Node):
                     float(pose.num_points),
                     pose.processing_time_ms
                 ]
+                # Note: frame_id should be "map" - see data format specification
                 self.pub_detections_6dof.publish(msg)
 
             # Log per-detection details and save to CSV

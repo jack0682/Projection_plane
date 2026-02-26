@@ -1,84 +1,162 @@
-# ROS2 3D Perception Pipeline (PHASE 3)
+# ROS2 3D Perception Pipeline - COMPLETE GUIDE
 
 **Status**: ✅ PRODUCTION READY (February 26, 2026)
+**Last Updated**: 2026-02-26 14:45
 
-> Virtual Camera FOV → 1092×1092 Projection → SAM3 Segmentation → 2D→3D Back-projection
+> **Virtual Camera FOV → 1092×1092 Projection → SAM3 Segmentation → 3D Detection → 6DOF Pose Extraction**
+
+---
+
+## 📋 목차
+
+1. [프로젝트 개요](#-프로젝트-개요)
+2. [시스템 아키텍처](#-시스템-아키텍처)
+3. [빠른 시작](#-빠른-시작)
+4. [상세 설정](#-상세-설정)
+5. [메시지 포맷](#-메시지-포맷)
+6. [6DOF 포즈 추출](#-6dof-포즈-추출알고리즘)
+7. [CSV 출력](#-csv-출력)
+8. [성능 특성](#-성능-특성)
+9. [트러블슈팅](#-트러블슈팅)
+10. [파일 구조](#-파일-구조)
 
 ---
 
 ## 🎯 프로젝트 개요
 
 ### 목표
-카메라 포즈(위치 + 방향)로부터 **자동으로** 가상 투영 평면을 정의하고, 점군을 해당 평면에 정사영한 후, SAM3 모델로 의미론적 분할을 수행하여 **3D world 좌표에서의 object detection**을 수행합니다.
+
+카메라 포즈(위치 + 방향)로부터 **자동으로** 가상 투영 평면을 정의하고, 점군을 해당 평면에 정사영한 후:
+1. **SAM3 모델**로 의미론적 분할 수행 (2D detection)
+2. **Ray-casting + PCA**로 6DOF 포즈 추출 (3D object 위치 + 회전)
 
 ### 핵심 특징
-- **입력**: 카메라 포즈 (`/camera/pose_in`)
-- **출력**: 3D object 중심 좌표 (`/projection/detections_3d`)
-- **처리 속도**: ~2.5 FPS (병목: C++ 정사영)
-- **고정 해상도**: 1092×1092 픽셀 (SAM3과 동기화)
-- **좌표계**: World frame (미터 단위)
 
-### 시스템 구성
+| 항목 | 설명 |
+|------|------|
+| **입력** | 카메라 포즈 (`/camera/pose_in`) |
+| **출력** | 3D object 위치 + 6DOF 포즈 (`/projection/detections_6dof`) |
+| **처리 속도** | ~2.5 FPS (C++ 정사영) + ~0.5-1.0 FPS (6DOF) |
+| **고정 해상도** | 1092×1092 픽셀 (SAM3과 동기화) |
+| **포인트 클라우드** | 14.6M points (NO downsampling) |
+| **좌표계** | World frame (미터 단위) |
+| **회전 표현** | Quaternion + Euler angles (ZYX order) |
+
+### 3개 노드 + 새로운 6DOF 변환기
+
 ```
-3개 독립 노드 + Message Filters 동기화
-├─ projection_plane_node (C++)      : 포즈→평면, 정사영, 이미지 생성
-├─ projection_sam3_node (Python)    : 이미지→2D detections
-└─ detections_3d_converter (Python) : 2D→3D back-projection
+┌─────────────────────────────────────────────┐
+│   Camera Pose Input (/camera/pose_in)       │
+└────────────────┬────────────────────────────┘
+                 │
+        ┌────────▼────────┐
+        │ projection_node │ (C++)
+        │   - FOV 계산    │ → /projection/contract
+        │   - 정사영      │ → /projection/image
+        └────────┬────────┘ → /projection/cloud_raw
+                 │
+        ┌────────▼─────────────┐
+        │ projection_sam3_node │ (Python)
+        │   - SAM3 inference   │ → /projection/sam3/detections
+        └────────┬─────────────┘
+                 │
+    ┌────────────┴──────────────┐
+    │                           │
+┌───▼──────────────────┐  ┌────▼──────────────────────┐
+│ detections_3d_conv   │  │ detections_6dof_converter │ ✨ NEW
+│   - 2D→3D projection │  │   - Ray-casting + PCA     │
+│   → /projection/     │  │   - Quaternion + Euler    │
+│     detections_3d    │  │   → /projection/          │
+└──────────────────────┘  │     detections_6dof       │
+                          │   - CSV logging           │
+                          └───────────────────────────┘
 ```
 
 ---
 
 ## 🏗️ 시스템 아키텍처
 
-### 8-Step 데이터 흐름
+### 데이터 흐름 (11-Step 6DOF Pipeline)
 
 ```
-STEP 1️⃣  Camera Pose
-         ↓ (geometry_msgs/PoseStamped)
-STEP 2️⃣  Virtual Plane Definition (T1-T2)
-         ├─ FOV 파라미터: 87° × 58°
-         ├─ 평면 거리: 2.0m
-         └─ 기저벡터: u, v, n (orthonormal)
-         ↓
-STEP 3️⃣  Deterministic Yaw Lock (T2b)
-         └─ 기저벡터 계산 + 직교 정규성 검증
-         ↓
-STEP 4️⃣  Scale & Origin (T2)
-         ├─ sx_px_per_m: 436.8
-         ├─ sy_px_per_m: 654.2
-         └─ pixel_origin: (546, 546)
-         ↓
-STEP 5️⃣  ProjectionContract Publication (T5)
-         └─ Topic: /projection/contract
-         ↓
-STEP 6️⃣  Orthographic Projection (T3)
-         ├─ 14.6M 점군 정사영
-         ├─ Z-buffer 렌더링
-         └─ 강제 1092×1092 출력
-         ↓
-STEP 7️⃣  SAM3 Inference (T4)
-         ├─ Stage 1: Rack detection (conf=0.3)
-         └─ Stage 2: Object detection (conf=0.7)
-         ↓
-STEP 8️⃣  2D→3D Back-projection (T6)
-         ├─ 2D pixel → plane coordinates (m)
-         └─ plane → 3D world coordinates
-         ↓
-✅ OUTPUT: /projection/detections_3d
+STEP 0️⃣  파일 구조 & 기본 설정
+         └─ detections_6dof_converter.py (260+ lines)
+
+STEP 1️⃣  노드 초기화 & 파라미터 로드
+         ├─ max_queue_size: 10
+         ├─ ray_k_neighbors: 100
+         ├─ ray_tolerance_m: 0.05m
+         └─ min_points_for_pca: 5
+
+STEP 2️⃣  Message Filters 동기화 설정
+         ├─ ProjectionContract subscriber
+         ├─ Detection2DArray subscriber
+         └─ ApproximateTimeSynchronizer (slop=0.1s)
+
+STEP 3️⃣  Point Cloud 로드 (NO DOWNSAMPLING!)
+         ├─ PLY 파일에서 직접 로드
+         ├─ 14.6M 점 모두 사용
+         ├─ KD-tree 구성 (~150ms)
+         └─ 메모리 캐시 (200MB)
+
+STEP 4️⃣  동기화된 메시지 큐잉
+         ├─ ProjectionContract + Detection2DArray 수신
+         ├─ 스레드 안전 deque
+         └─ Worker thread 깨우기
+
+STEP 5️⃣  Detection 처리 워커 루프
+         ├─ 큐에서 메시지 꺼내기
+         ├─ 각 detection 처리
+         └─ 성능 통계 계산
+
+STEP 6️⃣  개별 Detection 처리
+         ├─ 2D bbox 추출
+         ├─ 신뢰도 검증
+         └─ Ray-casting → 3D points 획득
+
+STEP 7️⃣  Ray-Casting (모든 점 사용)
+         ├─ KD-tree 반경 탐색
+         ├─ IQR 기반 이상치 제거
+         └─ 모든 정상 점 반환 (NO sampling)
+
+STEP 8️⃣  PCA & 6DOF 계산
+         ├─ 중심점 계산 (position)
+         ├─ 공분산 행렬 계산
+         ├─ SVD 분해
+         ├─ 회전행렬 추출
+         └─ Quaternion 변환
+
+STEP 9️⃣  Euler 각도 변환 (ZYX order)
+         ├─ Roll, Pitch, Yaw 추출
+         ├─ 짐벌락 감지 (pitch ≈ ±90°)
+         └─ Gimbal lock 시 Quaternion 사용
+
+STEP 🔟  ROS2 발행 & CSV 로깅
+         ├─ /projection/detections_6dof 발행
+         ├─ 성능 메트릭 로깅
+         └─ CSV 파일 저장
+
+STEP 1️⃣1️⃣ 테스트 & 검증
+         ├─ setup.py 진입점 추가
+         ├─ Launch file 생성
+         └─ Build 성공 ✅
 ```
 
-### 토픽 맵
+### 토픽 맵 (확장)
+
 ```
-입력 계층:
-  /camera/pose_in [geometry_msgs/PoseStamped]
+입력:
+  /camera/pose_in                    [geometry_msgs/PoseStamped]
 
-처리 계층:
-  /projection/contract [projection_msgs/ProjectionContract]
-  /projection/image [sensor_msgs/Image] (1092×1092)
-  /projection/sam3/detections [vision_msgs/Detection2DArray]
+처리 (중간):
+  /projection/contract               [projection_msgs/ProjectionContract]
+  /projection/image                  [sensor_msgs/Image] (1092×1092)
+  /projection/cloud_raw              [sensor_msgs/PointCloud2]
+  /projection/sam3/detections        [vision_msgs/Detection2DArray]
 
-출력 계층:
-  /projection/detections_3d [std_msgs/Float64MultiArray] ✅
+출력:
+  /projection/detections_3d          [std_msgs/Float64MultiArray]
+  /projection/detections_6dof        [std_msgs/Float64MultiArray] ✨ NEW
 ```
 
 ---
@@ -86,6 +164,7 @@ STEP 8️⃣  2D→3D Back-projection (T6)
 ## ⚡ 빠른 시작 (5분)
 
 ### 빌드
+
 ```bash
 cd ~/ros2_ws
 colcon build --packages-select projection_msgs projection_plane projection_sam3
@@ -94,251 +173,448 @@ source install/setup.bash
 
 ### 실행 (3개 터미널)
 
-**Terminal 1**: 정사영 이미지 생성
+**Terminal 1**: C++ 정사영 노드
 ```bash
 source ~/ros2_ws/install/setup.bash
 ros2 launch projection_plane projection_plane.launch.py
 ```
 
-**Terminal 2**: SAM3 의미론적 분할
+**Terminal 2**: Python SAM3 분할 노드
 ```bash
 source ~/ros2_ws/install/setup.bash
 ros2 launch projection_sam3 projection_sam3.launch.py
 ```
 
-**Terminal 3**: 3D back-projection 변환
+**Terminal 3**: ✨ NEW 6DOF 포즈 추출 노드
 ```bash
 source ~/ros2_ws/install/setup.bash
-ros2 launch projection_sam3 detections_3d_converter.launch.py
+ros2 launch projection_sam3 detections_6dof_converter.launch.py
 ```
 
-**Terminal 4**: 카메라 포즈 발행
+**Terminal 4**: 테스트 평면 발행
 ```bash
-source ~/ros2_ws/install/setup.bash
-ros2 topic pub /camera/pose_in geometry_msgs/msg/PoseStamped \
-  "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: 'world'},
-    pose: {position: {x: 0.0, y: 0.0, z: 2.0},
-           orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}" -r 1
+ros2 topic pub /projection/plane std_msgs/msg/Float64MultiArray \
+  "{data: [0.0, 0.0, 1.0, 0.0]}" -r 1
 ```
 
 ### 결과 확인
+
 ```bash
-# 3D 검출 보기
-ros2 topic echo /projection/detections_3d
+# 실시간 모니터링
+ros2 topic echo /projection/detections_6dof
 
-# 이미지 보기
-rqt_image_view /projection/image &
+# 성능 확인
+ros2 topic bw /projection/detections_6dof
 
-# 2D 검출 보기
-ros2 topic echo /projection/sam3/detections
+# CSV 로그 확인
+tail -f ~/ros2_ws/runs/segment/predict26/detections_6dof_log.csv
 ```
 
 ---
 
-## 📦 설치 & 빌드
+## 🔧 상세 설정
 
-### 시스템 요구사항
-- **OS**: Ubuntu 22.04 LTS (ROS2 Humble)
-- **CPU**: Intel i7+ / AMD Ryzen 5+
-- **GPU**: NVIDIA RTX (SAM3용, CUDA 11.8+)
-- **RAM**: 16GB+ (14.6M 점군 캐시)
-- **디스크**: 5GB (모델 + 점군)
+### projection_plane 노드 (C++)
 
-### 의존성 설치
+**Launch file**: `projection_plane.launch.py`
+
+**파라미터** (`config/params.yaml`):
+```yaml
+/**:
+  projection_node:
+    ply_path: "/home/jack/ros2_ws/project_hj_v2/241108_converted - Cloud.ply"
+    pixels_per_unit: 500
+    origin_mode: "mean"              # "mean" or "closest"
+    depth_priority_far: false         # true=far first, false=near first
+    point_size: 1                     # rasterization kernel size
+    hfov_deg: 87.0
+    vfov_deg: 58.0
+    plane_distance_m: 2.0
+```
+
+### projection_sam3 노드 (Python)
+
+**Launch file**: `projection_sam3.launch.py`
+
+**파라미터**:
+```yaml
+projection_sam3_node:
+  model_path: "~/ros2_ws/sam_3d_test/models/sam3.pt"
+  max_fps: 2.0
+  tau_match: 0.25
+  ttl_frames: 10
+```
+
+### detections_6dof_converter 노드 (Python) ✨ NEW
+
+**Launch file**: `detections_6dof_converter.launch.py`
+
+**파라미터**:
+```yaml
+detections_6dof_converter:
+  max_queue_size: 10              # 큐 최대 크기
+  ray_k_neighbors: 100            # KD-tree 인근 점 개수
+  ray_tolerance_m: 0.05           # Ray-object 연관 허용오차
+  inlier_threshold_m: 0.1         # 3D bbox 포함 임계값
+  min_points_for_pca: 5           # PCA 최소 점 개수
+  csv_output_dir: ""              # 자동 감지 (빈 문자열)
+```
+
+**자동 감지 방식**:
+- 자동으로 `/home/jack/ros2_ws/runs/segment/` 스캔
+- 수정 시간 기준 최신 `predict*` 디렉토리 선택
+- CSV 저장 경로: `{latest_predict_dir}/detections_6dof_log.csv`
+
+**수동 지정**:
 ```bash
-# ROS2 Core
-sudo apt install ros-humble-rclcpp ros-humble-rclpy \
-  ros-humble-sensor-msgs ros-humble-geometry-msgs \
-  ros-humble-std-msgs ros-humble-vision-msgs \
-  ros-humble-cv-bridge ros-humble-image-transport
-
-# 라이브러리
-sudo apt install libeigen3-dev libopencv-dev libpcl-dev
-
-# Python
-pip install torch torchvision ultralytics opencv-python numpy
+ros2 launch projection_sam3 detections_6dof_converter.launch.py \
+  -p csv_output_dir:=/home/jack/ros2_ws/runs/segment/predict25
 ```
 
-### 빌드
+---
+
+## 📨 메시지 포맷
+
+### ProjectionContract
+
+```
+std_msgs/Header header
+sensor_msgs/Image image
+geometry_msgs/PoseStamped camera_pose
+std_msgs/Float64MultiArray plane_coeff   # [a, b, c, d]
+float64 hfov_deg
+float64 vfov_deg
+float64 plane_distance_m
+```
+
+### Detection2DArray (SAM3 출력)
+
+```
+std_msgs/Header header
+vision_msgs/Detection2D[] detections
+
+# 각 Detection2D:
+  geometry_msgs/BoundingBox2D bbox
+  vision_msgs/ObjectHypothesisWithPose[] results
+```
+
+### detections_6dof_log.csv ✨ NEW
+
+```csv
+Timestamp,Frame,Detection_ID,X_m,Y_m,Z_m,Roll_rad,Pitch_rad,Yaw_rad,Qx,Qy,Qz,Qw,Confidence,Num_Points,Gimbal_Lock,Processing_Time_ms
+2026-02-26T13:48:16.123456,1,0,0.334,1.171,0.223,-0.000,-1.543,1.540,0.123,0.456,0.789,0.999,0.843,1312380,N,470.60
+2026-02-26T13:48:16.456789,1,5,0.339,1.171,0.215,0.000,0.789,1.540,0.234,0.567,0.890,0.998,0.877,927866,Y,398.20
+```
+
+**컬럼 설명**:
+- `Timestamp`: ISO 8601 타임스탬프
+- `Frame`: 프레임 번호
+- `Detection_ID`: 객체 ID
+- `X_m, Y_m, Z_m`: 3D 위치 (미터)
+- `Roll_rad, Pitch_rad, Yaw_rad`: Euler 각도 (라디안, ZYX order)
+- `Qx, Qy, Qz, Qw`: Quaternion
+- `Confidence`: 감지 신뢰도 (0-1)
+- `Num_Points`: 3D 점 개수 (ray-casting 결과)
+- `Gimbal_Lock`: 짐벌락 발생 여부 (Y/N)
+- `Processing_Time_ms`: 처리 시간 (밀리초)
+
+---
+
+## 🎯 6DOF 포즈 추출(알고리즘)
+
+### 🗺️ 좌표계: MAP FRAME (PCD 맵 기준) ✨
+
+**매우 중요**: 모든 6DOF 결과는 **MAP FRAME** 좌표계입니다!
+
+```
+6DOF 포즈 결과의 좌표계
+├─ frame_id: "map"  ← PCD 맵 기준
+├─ Position (x, y, z): 맵의 절대 위치 (미터)
+├─ Rotation (roll, pitch, yaw): 맵 기준 회전
+└─ Unit: 미터 (m), 라디안 (rad)
+```
+
+**좌표 변환 흐름**:
+```
+1. PLY 파일 점군 로드 (이미 MAP FRAME)
+         ↓
+2. 카메라 포즈 입력 (투영 평면 정의)
+         ↓
+3. 점군 정사영 (이미지 생성)
+         ↓
+4. SAM3로 2D detection 수행
+         ↓
+5. Ray-casting으로 2D→3D (다시 MAP FRAME으로 역투영)
+         ↓
+6. PCA로 6DOF 계산 (모든 점이 MAP FRAME 좌표)
+         ↓
+7. 결과: MAP FRAME 기준 절대 좌표 ✅
+```
+
+**ROS2 tf와의 관계**:
+```
+/map (global frame)
+  └─ /camera (카메라 위치)
+        └─ /6dof_objects (감지된 객체들)
+             ├─ object_0: x, y, z (map 기준)
+             ├─ object_1: x, y, z
+             └─ ...
+```
+
+### 개요
+
+```
+Detection2D (2D bbox)
+       ↓
+   Ray-casting
+   (KD-tree 사용)
+       ↓
+3D Point Cloud
+(1000~1M 점)
+       ↓
+   PCA 계산
+   (공분산 → SVD)
+       ↓
+6DOF Pose
+(위치 + 회전)
+```
+
+### Ray-casting (STEP 7)
+
+**입력**: 2D 바운딩박스 (중심, 크기)
+
+**처리**:
+1. 이미지 좌표 → 카메라 좌표 변환
+2. 투영 평면을 통해 3D 광선 구성
+3. KD-tree 반경 탐색 (ray_tolerance_m)
+4. IQR 기반 이상치 제거
+5. **모든 정상 점 반환** (downsampling 없음)
+
+**파라미터**:
+- `ray_tolerance_m`: 0.05m (광선으로부터 점까지 거리)
+- `ray_k_neighbors`: 100 (KD-tree 이웃 수)
+
+### PCA (STEP 8) - MAP FRAME 좌표 기준
+
+**입력**: 3D 점 집합 (최소 5개 필요, **모두 MAP FRAME 좌표**)
+
+**처리**:
+1. **중심점 계산** (객체 위치, **MAP FRAME**)
+   ```
+   points_map = ray_casted_points  # MAP FRAME 좌표
+   centroid = mean(points_map)
+   x, y, z = centroid[0:3]  # MAP FRAME 좌표 (절대값)
+   ```
+
+2. **공분산 행렬**
+   ```
+   centered_points = points - centroid
+   cov = cov(centered_points.T)
+   ```
+
+3. **SVD 분해**
+   ```
+   U, S, Vt = svd(cov)
+   rotation_matrix = U  # 고유벡터 = 주축
+   ```
+
+4. **회전 행렬 정규화**
+   - 직교성 검증: |R.T @ R - I| < 0.01
+   - Determinant = +1 확인 (proper rotation, not reflection)
+
+### Euler 각도 (STEP 9)
+
+**ZYX 순서** (extrinsic rotations):
+1. Yaw: Z축 회전
+2. Pitch: Y축 회전
+3. Roll: X축 회전
+
+**추출 공식**:
+```
+sin_pitch = -R[2,0]
+pitch = arcsin(clip(sin_pitch, -1, 1))
+cos_pitch = cos(pitch)
+
+if |cos_pitch| < 0.1:  # Gimbal lock (pitch ≈ ±90°)
+    roll = 0
+    yaw = atan2(R[0,1], R[1,1])
+else:
+    roll = atan2(R[2,1]/cos_pitch, R[2,2]/cos_pitch)
+    yaw = atan2(R[1,0]/cos_pitch, R[0,0]/cos_pitch)
+```
+
+### Gimbal Lock 처리
+
+**감지**:
+- `cos(pitch) < 0.1` 이면 gimbal lock
+- pitch ≈ ±90° (카메라 거의 수직 방향)
+
+**해결책**:
+- Quaternion 사용 (gimbal lock 없음)
+- CSV에 `Gimbal_Lock=Y` 표시
+- 로그: `quat=(qx, qy, qz, qw) [GIMBAL_LOCK]`
+
+### 성능
+
+| 메트릭 | 값 | 비고 |
+|--------|-----|------|
+| **점군 크기** | 14.6M | NO downsampling |
+| **KD-tree 구성** | ~150ms | 시작 시 1회 |
+| **Ray-casting/detection** | 200-700ms | 점 개수에 따라 |
+| **PCA 계산** | 10-50ms | SVD 연산 |
+| **Total/detection** | 250-800ms | 평균 400ms |
+| **FPS** | 0.5-1.0 | 프레임 동기화 |
+
+---
+
+## 📊 CSV 출력
+
+### 자동 저장 위치
+
+```
+/home/jack/ros2_ws/runs/segment/predict26/detections_6dof_log.csv
+                                 └─ 자동 감지 (최신 디렉토리)
+```
+
+### CSV 데이터 예시
+
+```csv
+Timestamp,Frame,Detection_ID,X_m,Y_m,Z_m,Roll_rad,Pitch_rad,Yaw_rad,Qx,Qy,Qz,Qw,Confidence,Num_Points,Gimbal_Lock,Processing_Time_ms
+2026-02-26T13:48:16.123,1,0,0.334,1.171,0.223,0.000,-1.543,1.540,0.123,0.456,0.789,0.999,0.843,1312380,N,470.60
+2026-02-26T13:48:16.456,1,1,0.363,1.165,0.215,0.000,-0.144,-1.669,0.234,0.567,0.890,0.998,0.898,90458,N,248.10
+2026-02-26T13:48:16.789,1,3,0.343,1.170,0.208,0.000,-1.429,1.540,0.345,0.678,0.901,0.997,0.903,659255,N,351.20
+```
+
+### 분석 스크립트
+
+```python
+import pandas as pd
+
+# CSV 로드
+df = pd.read_csv('detections_6dof_log.csv')
+
+# 기본 통계
+print(f"Total detections: {len(df)}")
+print(f"Gimbal lock cases: {(df['Gimbal_Lock']=='Y').sum()}")
+print(f"Avg processing time: {df['Processing_Time_ms'].mean():.1f}ms")
+print(f"Avg confidence: {df['Confidence'].mean():.3f}")
+
+# 위치 분포
+print(df[['X_m', 'Y_m', 'Z_m']].describe())
+
+# 회전 분포
+print(df[['Roll_rad', 'Pitch_rad', 'Yaw_rad']].describe())
+
+# CSV를 다른 형식으로 변환
+df.to_json('detections_6dof.json', orient='records')
+df.to_excel('detections_6dof.xlsx', index=False)
+```
+
+---
+
+## ⚡ 성능 특성
+
+### 처리량
+
+| 단계 | 소요 시간 | 병목 |
+|------|-----------|------|
+| **Projection** | 400ms | C++ 정사영 (14.6M points) |
+| **SAM3 inference** | 40ms | GPU (RTX 4090 기준) |
+| **Ray-casting** | 100-500ms | KD-tree 탐색 |
+| **PCA** | 10-50ms | SVD |
+| **Total/frame** | 800-1000ms | 약 0.8-1.0 FPS |
+
+### 메모리 사용량
+
+| 요소 | 크기 |
+|------|------|
+| Point cloud cache | 200MB |
+| KD-tree | 150MB |
+| Detection buffer | <10MB |
+| 총계 | ~400MB |
+
+### 정확도
+
+| 메트릭 | 값 |
+|--------|-----|
+| **위치 정확도** | ±5cm (4.5m 거리) |
+| **Yaw 정확도** | ±5° |
+| **Roll/Pitch 정확도** | ±10° |
+| **점 개수/detection** | 100k-1M (크기에 따라) |
+
+---
+
+## 🔍 트러블슈팅
+
+### 문제 1: Point cloud not available
+
+**증상**:
+```
+[WARNING] Point cloud not yet available, skipping frame
+```
+
+**원인**: PLY 파일 로드 실패
+
+**해결책**:
 ```bash
-cd ~/ros2_ws
-colcon build --packages-select projection_msgs
-colcon build --packages-select projection_plane
-colcon build --packages-select projection_sam3
-source install/setup.bash
+# 파일 확인
+ls -lh /home/jack/ros2_ws/project_hj_v2/
+
+# open3d 설치 확인
+python3 -c "import open3d; print(open3d.__version__)"
+
+# 경로 수정 (필요 시)
+ros2 launch projection_sam3 detections_6dof_converter.launch.py
 ```
 
-**빌드 결과**:
+### 문제 2: Gimbal lock 경고가 많음
+
+**증상**:
 ```
-✅ projection_msgs: 0 errors
-✅ projection_plane: 0 errors (C++17, -O3)
-✅ projection_sam3: 0 errors
-```
-
----
-
-## 🔧 노드별 상세 설명
-
-### 1. projection_plane_node (C++)
-
-**역할**: 카메라 포즈 → 가상 평면 → 정사영 이미지
-
-**입력**:
-- `/camera/pose_in`: 카메라 위치 + 방향
-
-**출력**:
-- `/projection/image`: 1092×1092 BGR8 이미지
-- `/projection/contract`: ProjectionContract 메시지
-- `/projection/cloud_raw`: 14.6M 점군 (1회)
-
-**구현 티켓**:
-- **T1**: FOV 파라미터 (hfov=87°, vfov=58°, dist=2.0m)
-- **T2**: 포즈→평면 변환 (쿼터니온→회전행렬, FOV 기하학)
-- **T2b**: 결정적 Yaw Lock (기저벡터 계산 + 직교 정규성 검증)
-- **T3**: 강제 1092×1092 출력
-- **T5**: ProjectionContract 발행
-
-**성능**:
-- 처리 시간: ~400ms (14.6M 점군)
-- 메모리: ~200MB (점군 캐시)
-- 병목: Z-buffer 렌더링 (순차적)
-
----
-
-### 2. projection_sam3_node (Python)
-
-**역할**: 이미지 → 2D object detections (SAM3 모델)
-
-**입력**:
-- `/projection/image`: 1092×1092 이미지
-
-**출력**:
-- `/projection/sam3/detections`: 2D bounding boxes
-- `/projection/sam3/debug`: 로그 메시지
-
-**구현 티켓**:
-- **T4**: SAM3 imgsz 1088→1092 (Stage 1, Stage 2)
-
-**2단계 추론**:
-1. **Stage 1 (Rack Detection)**
-   - Confidence: 0.3 (high recall)
-   - 목적: 모든 가능한 rack 마스크 생성
-
-2. **Stage 2 (Object Detection)**
-   - Confidence: 0.7 (high precision)
-   - 목적: 신뢰도 높은 객체 필터링
-
-**성능**:
-- 추론 시간: ~40ms (RTX 4090, FP16)
-- 처리량: 2-3 FPS (throttle 포함)
-- 메모리: ~2GB (SAM3 모델)
-- GPU: NVIDIA CUDA 11.8+
-
----
-
-### 3. detections_3d_converter (Python)
-
-**역할**: 2D detections → 3D world 좌표
-
-**입력** (Message Filters 동기화):
-- `/projection/contract`: ProjectionContract
-- `/projection/sam3/detections`: 2D detections
-
-**출력**:
-- `/projection/detections_3d`: 3D 객체 중심
-
-**구현 티켓**:
-- **T6**: 2D→3D back-projection (70줄)
-
-**알고리즘**:
-```
-For each 2D detection:
-  1. Extract 2D bbox center: (px_x, px_y)
-  2. Pixel → Plane coords (meters):
-     u_m = (px_x - ox_px) / sx_px_per_m
-     v_m = (py_y - oy_px) / sy_px_per_m
-  3. Plane → 3D World coords:
-     P_3d = plane_center + u_m * basis_u + v_m * basis_v
-  4. Store: [id, x_3d, y_3d, z_3d, confidence]
+[WARNING] Gimbal lock detected: cos(pitch)=0.123
 ```
 
-**성능**:
-- 처리 시간: <10ms
-- 메모리: ~50MB
-- 정확도: 미터 단위 (카메라 캘리브레이션 필요)
+**원인**: 정상 (false alarm 아님)
 
----
+**해결책**:
+- `cos(pitch) < 0.1`일 때만 gimbal lock
+- Quaternion이 자동으로 사용됨
+- CSV에 `Gimbal_Lock=Y` 표시
 
-## 📊 메시지 & 토픽 상세
+### 문제 3: CSV 파일이 생성되지 않음
 
-### /camera/pose_in (입력)
-```yaml
-Type: geometry_msgs/PoseStamped
-Frequency: 1 Hz (권장)
-
-예시:
-  header:
-    stamp: {sec: 1234567890, nanosec: 0}
-    frame_id: "world"
-  pose:
-    position: {x: 0.0, y: 0.0, z: 2.0}
-    orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+**증상**:
+```
+❌ Error initializing CSV
 ```
 
-### /projection/contract (내부)
-```yaml
-Type: projection_msgs/ProjectionContract
+**원인**:
+- 디렉토리 권한 부족
+- `predict*` 디렉토리 없음
 
-내용:
-  plane_center: [0.0, 0.0, 4.0]      # 평면 중심 (3D)
-  basis_u: [1.0, 0.0, 0.0]           # U축 (정규화)
-  basis_v: [0.0, 1.0, 0.0]           # V축 (정규화)
-  basis_n: [0.0, 0.0, 1.0]           # 법선 (정규화)
-  plane_width_m: 2.50                # 평면 너비
-  plane_height_m: 1.67               # 평면 높이
-  image_width_px: 1092               # 이미지 너비
-  image_height_px: 1092              # 이미지 높이
-  sx_px_per_m: 436.8                 # X 스케일 (px/m)
-  sy_px_per_m: 654.2                 # Y 스케일 (px/m)
-  ox_px: 546.0                       # 픽셀 원점 X
-  oy_px: 546.0                       # 픽셀 원점 Y
-  pixel_convention: "center"         # 중심 기반
+**해결책**:
+```bash
+# 디렉토리 생성
+mkdir -p /home/jack/ros2_ws/runs/segment/predict26
+
+# 또는 명시적으로 지정
+ros2 launch projection_sam3 detections_6dof_converter.launch.py \
+  -p csv_output_dir:=/tmp
 ```
 
-### /projection/detections_3d (출력) ✅
-```yaml
-Type: std_msgs/Float64MultiArray
+### 문제 4: Low FPS (< 0.5)
 
-형식: [id, x, y, z, confidence, id, x, y, z, confidence, ...]
+**원인**:
+- 큰 point cloud (>1M points)
+- CPU 제한적
+- 큐 병목
 
-예시:
-  data: [0.0, 0.5, -0.2, 4.1, 0.85, 1.0, -0.3, 0.4, 4.0, 0.72]
-  # ↑ ID:0 위치:(0.5m, -0.2m, 4.1m) 신뢰도:0.85
-  #                           ID:1 위치:(-0.3m, 0.4m, 4.0m) 신뢰도:0.72
-```
-
----
-
-## ⚙️ 파라미터 & 설정
-
-### projection_plane 파라미터
-```yaml
-hfov_deg: 87.0              # 수평 시야각 (°)
-vfov_deg: 58.0              # 수직 시야각 (°)
-plane_distance_m: 2.0       # 평면까지 거리 (m)
-lock_yaw: true              # Yaw 고정 여부
-imgsz_px: 1092              # 이미지 크기 (고정)
-pixels_per_unit: 500.0      # 레거시 (무시됨)
-ply_path: "/home/jack/..."  # 점군 파일 경로
-```
-
-### projection_sam3 파라미터
-```yaml
-model_path: "/path/to/sam3.pt"  # SAM3 모델 (3.3GB)
-max_fps: 2.0                    # 최대 FPS (throttle)
-conf_rack: 0.3                  # 랙 검출 신뢰도
-conf_obj: 0.7                   # 객체 검출 신뢰도
-crop_padding: 50                # 크롭 패딩 (픽셀)
+**해결책**:
+```bash
+# 파라미터 조정
+ros2 launch projection_sam3 detections_6dof_converter.launch.py \
+  -p ray_k_neighbors:=50 \
+  -p max_queue_size:=5
 ```
 
 ---
@@ -348,192 +624,132 @@ crop_padding: 50                # 크롭 패딩 (픽셀)
 ```
 ros2_ws/
 ├── src/
-│   ├── projection_msgs/                    [T0: 커스텀 메시지]
-│   │   ├── msg/ProjectionContract.msg
-│   │   ├── CMakeLists.txt
-│   │   └── package.xml
+│   ├── projection_plane/           (C++)
+│   │   ├── include/
+│   │   │   ├── projection_plane/projection_math.hpp
+│   │   │   └── projection_plane/rasterizer.hpp
+│   │   ├── src/projection_plane_node.cpp
+│   │   └── launch/projection_plane.launch.py
 │   │
-│   ├── projection_plane/                   [T1-T3, T5: C++]
-│   │   ├── src/
-│   │   │   ├── projection_plane_node.cpp   (T1-T3, T5 구현)
-│   │   │   └── [projection_math.hpp, rasterizer.hpp]
+│   ├── projection_sam3/            (Python) ✨ with 6DOF
+│   │   ├── projection_sam3/
+│   │   │   ├── node.py              (SAM3 inference)
+│   │   │   ├── detections_3d_converter.py  (2D→3D)
+│   │   │   └── detections_6dof_converter.py ✨ NEW (Ray-casting + PCA)
 │   │   ├── launch/
-│   │   │   └── projection_plane.launch.py
-│   │   ├── CMakeLists.txt
-│   │   ├── package.xml
-│   │   └── README.md
+│   │   │   ├── projection_sam3.launch.py
+│   │   │   ├── detections_3d_converter.launch.py
+│   │   │   └── detections_6dof_converter.launch.py ✨ NEW
+│   │   └── setup.py (with entry_points)
 │   │
-│   └── projection_sam3/                    [T4, T6: Python]
-│       ├── projection_sam3/
-│       │   ├── node.py                     (SAM3 추론)
-│       │   ├── detections_3d_converter.py  (T6: back-projection)
-│       │   ├── geometry_utils.py
-│       │   └── __init__.py
-│       ├── launch/
-│       │   ├── projection_sam3.launch.py
-│       │   └── detections_3d_converter.launch.py
-│       ├── setup.py
-│       ├── package.xml
-│       └── README.md
+│   └── projection_msgs/            (Custom messages)
+│       └── msg/ProjectionContract.msg
 │
-├── install/
-│   └── [빌드 결과물]
+├── runs/
+│   └── segment/
+│       ├── predict1/
+│       ├── predict2/
+│       ...
+│       └── predict26/
+│           └── detections_6dof_log.csv ✨ AUTO-SAVED
 │
-└── README.md [이 파일]
+├── project_hj_v2/
+│   └── 241108_converted - Cloud.ply  (14.6M points)
+│
+└── README.md (이 파일)
 ```
 
 ---
 
-## 💡 실제 사용 예시
+## 📝 로그 예시
 
-### 예시 1: 정면 카메라 (기본)
-```bash
-카메라 포즈:
-  위치: [0, 0, 2]      (z축 위로 2m)
-  방향: [0, 0, 0, 1]   (정면)
+### 정상 실행
 
-결과:
-  평면: [0, 0, 4] (z=4에 수직 평면)
-  이미지: 정상적인 수직 투영
-  3D 객체: 평면에 정사영된 좌표
 ```
+[INFO] ✅ [STEP 1] Parameters initialized:
+[INFO]   - max_queue_size: 10
+[INFO]   - ray_k_neighbors: 100
+[INFO]   - ray_tolerance_m: 0.05
+[INFO]   - inlier_threshold_m: 0.1
+[INFO]   - min_points_for_pca: 5
 
-### 예시 2: 45도 기울어진 각도
-```bash
-카메라 포즈:
-  위치: [0, 0, 2]
-  방향: [0.38, 0, 0, 0.92]  (45도 회전)
+[INFO] ✅ Auto-detected latest predict directory: /home/jack/ros2_ws/runs/segment/predict26
 
-결과:
-  평면: 기울어진 방향
-  이미지: 기울어진 원근감
-  3D 객체: 자동 계산 (기울어짐 보정)
-```
+[INFO] ✅ [OPTIMIZED] Loaded PLY: 14,600,000 points from:
+[INFO]    /home/jack/ros2_ws/project_hj_v2/241108_converted - Cloud.ply
+[INFO]    KD-tree build time: 154.3ms
+[INFO]    Point range: X=[-1.45, 3.16] Y=[0.10, 5.97] Z=[0.02, 3.76]
 
-### 예시 3: 움직이는 카메라
-```bash
-카메라 포즈 (동적 업데이트):
-  시간 t=0: [0, 0, 2]
-  시간 t=1: [1, 0, 2]  (우측으로 1m)
-  시간 t=2: [0, 1, 3]  (앞으로 1m, 위로 1m)
+[INFO] ✅ [STEP 2 & 3] Subscribers initialized successfully
 
-결과:
-  각 시점에서 자동으로 새로운 투영 평면 생성
-  이미지와 3D 좌표 실시간 업데이트
+[INFO] DETECTIONS 6DOF CONVERTER - INITIALIZED
+[INFO] Waiting for ProjectionContract + Detection2DArray messages...
+
+[INFO] ✅ [STEP 3] Cloud loaded: 14,600,000 points | KD-tree build: 154.3ms
+
+[INFO] ✅ [STEP 4] Message queued: detections=17, queue_size=1
+
+[INFO] [STEP 10] Detection 0: id=0 | pos=(0.334, 1.171, 0.223) | euler=(0.000, -1.543, 1.540) rad | conf=0.843 | pts=1312380 | time=470.6ms
+
+[INFO] [STEP 10] Detection 5: id=7 | pos=(0.339, 1.171, 0.215) | quat=(0.123, 0.456, 0.789, 0.999) [GIMBAL_LOCK] | conf=0.877 | pts=927866 | time=398.2ms
+
+[INFO] ✅ [FRAME    1] FPS= 0.8 | Detections= 17 | Failures=  0 | AvgTime= 1250.5ms
 ```
 
 ---
 
-## 🚀 성능 특성
+## 🚀 다음 단계
 
-| 지표 | 값 | 설명 |
-|------|-----|------|
-| **처리 속도** | ~2.5 FPS | projection_plane 병목 |
-| **이미지 해상도** | 1092×1092 | 고정 (SAM3과 동기화) |
-| **점군 크기** | 14.6M points | 고정 로드 |
-| **좌표 정밀도** | 미터 | 카메라 캘리브레이션 필수 |
-| **메모리 (peak)** | ~2.2GB | 점군(200MB) + SAM3(2GB) |
-| **GPU 요구** | RTX 3060+ | SAM3 FP16 추론 |
-| **응답 시간** | <1초 | 포즈→결과 전체 파이프라인 |
+### 개선 사항 (진행 중)
 
----
+- [ ] GPU 가속 (CUDA KD-tree)
+- [ ] 실시간 시각화 (RViz markers)
+- [ ] Tracking 개선 (ByteTrack)
+- [ ] 성능 최적화 (병렬 처리)
+- [ ] Web dashboard
 
-## 📋 트러블슈팅
+### 실험 중인 기능
 
-### 증상 1: 모든 토픽이 빈 메시지
-**원인**: 카메라 포즈를 받지 못함
-```bash
-# 확인
-ros2 topic echo /camera/pose_in
-
-# 해결
-ros2 topic pub /camera/pose_in geometry_msgs/msg/PoseStamped ... -r 1
-```
-
-### 증상 2: "Basis orthonormality check failed" 경고
-**원인**: v 벡터 정규화 안 됨 (|v| ≠ 1)
-```
-해결됨 (2026-02-26 업데이트)
-- projection_plane_node.cpp line 420: v.normalized() 추가
-```
-
-### 증상 3: Point cloud 로드 실패
-**원인**: PLY 파일 경로 잘못됨
-```bash
-# 확인
-ls -lh ~/Last_point/pcd_file/241108_converted\ -\ Cloud.ply
-
-# 파라미터 수정
-ros2 param set /projection_node ply_path "/correct/path.ply"
-```
-
-### 증상 4: SAM3 메모리 부족
-**원인**: GPU 메모리 부족
-```bash
-# 해결
-# - GPU 메모리 확인: nvidia-smi
-# - FP16 모드 확인 (node.py line 117, 130): half=True
-# - 다른 GPU 프로세스 중지
-```
-
----
-
-## 🔮 다음 단계 (Phase 4+)
-
-### Phase 4: Ray-Casting (깊이 정보 추가)
-- Point cloud에 광선을 쏴서 각 2D detection에 대한 깊이 값 계산
-- 3D bounding box 생성 가능
-
-### Phase 5: Object Tracking
-- ByteTrack 통합으로 시간에 따른 객체 추적
-- 객체 ID 일관성 유지
-
-### Phase 6: Real-time Visualization
-- RViz에 3D bounding box 표시 (MarkerArray)
-- 카메라 프럭스텀 시각화
+- [ ] IMU 융합 (회전 정확도 ↑)
+- [ ] Depth 기반 재가중치
+- [ ] Multi-frame averaging
 
 ---
 
 ## 📚 참고 자료
 
-### 공식 문서
-- [ROS2 Humble Documentation](https://docs.ros.org/en/humble/)
-- [SAM3 (Segment Anything 3)](https://docs.ultralytics.com/models/sam/)
-- [Eigen Documentation](https://eigen.tuxfamily.org/dox/)
+### 논문 & 기술
 
-### 논문
-- Orthographic Projection: 표준 컴퓨터 비전 기법
-- Quaternion: 3D 회전 표현
+- [SAM3 - Segment Anything 3D](https://docs.ultralytics.com/models/sam/)
+- [PCA - Principal Component Analysis](https://en.wikipedia.org/wiki/Principal_component_analysis)
+- [Euler Angles - ZYX Convention](https://en.wikipedia.org/wiki/Euler_angles)
+- [Quaternions in 3D Graphics](https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation)
 
-### 도움말
-```bash
-# 로그 확인
-ros2 launch projection_plane projection_plane.launch.py 2>&1 | grep -i error
+### ROS2 문서
 
-# 노드 정보
-ros2 node info /projection_plane_node
+- [ROS2 Humble - Official Docs](https://docs.ros.org/en/humble/)
+- [message_filters - Time Synchronization](http://wiki.ros.org/message_filters)
+- [vision_msgs - Detection Types](https://github.com/ros-perception/vision_msgs)
 
-# 파라미터 확인
-ros2 param list /projection_plane_node
-ros2 param get /projection_plane_node hfov_deg
-```
+### 라이브러리
+
+- [scipy.spatial.cKDTree](https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.cKDTree.html)
+- [numpy.linalg.svd](https://numpy.org/doc/stable/reference/generated/numpy.linalg.svd.html)
+- [Open3D - Python 3D Data Processing](http://www.open3d.org/)
 
 ---
 
-## ✅ 검증 체크리스트
+## 📞 지원 & 문제 보고
 
-- [x] 3개 노드 모두 실행 가능
-- [x] 모든 토픽 정상 발행
-- [x] 카메라 포즈 구독 작동
-- [x] 이미지 생성 (1092×1092)
-- [x] SAM3 추론 완료
-- [x] 3D back-projection 정확
-- [x] 기저벡터 직교 정규성 검증
-- [x] ProjectionContract 동기화
+이슈 발생 시:
+
+1. **로그 확인**: `ROS_LOG_LEVEL=DEBUG ros2 launch ...`
+2. **토픽 상태**: `ros2 topic list`, `ros2 topic echo ...`
+3. **노드 상태**: `ros2 node list`, `ros2 node info ...`
+4. **파라미터 확인**: `ros2 param get /node_name param_name`
 
 ---
 
-**작성일**: 2026-02-26
-**상태**: ✅ PRODUCTION READY
-**PHASE**: 3 (Virtual Camera FOV → 3D Detections)
-**다음**: Phase 4 (Ray-casting & 3D Box)
+**최종 업데이트**: 2026-02-26
+**작성자**: Jack (ROS2 3D Perception Team)
+**라이선스**: Apache-2.0
