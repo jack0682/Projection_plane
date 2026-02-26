@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/projection_sam3.launch.py',
             'launch/detections_3d_converter.launch.py',
+            'launch/detections_6dof_converter.launch.py',
         ]),
     ],
     install_requires=['setuptools'],
@@ -30,6 +31,7 @@ setup(
         'console_scripts': [
             'projection_sam3_node = projection_sam3.node:main',
             'detections_3d_converter = projection_sam3.detections_3d_converter:main',
+            'detections_6dof_converter = projection_sam3.detections_6dof_converter:main',
         ],
     },
 )
