@@ -698,6 +698,384 @@ ros2_ws/
 
 ---
 
+## 📊 AprilTag 포즈 검증 & 비교 분석
+
+### 개요: 두 가지 6DOF 포즈 시스템
+
+현재 시스템은 **두 가지 독립적인 6DOF 포즈 추정 방식**을 지원합니다:
+
+| 항목 | SAM3 기반 (기존) | AprilTag 기반 (신규) |
+|------|-------------|-------------|
+| **입력** | 2D 세그멘테이션 마스크 | 2D AprilTag 코너 |
+| **추출 방식** | Ray-casting + PCA | Homography decomposition + SVD |
+| **정확도** | 중간 (객체 모양 의존) | 높음 (태그 기하학 기반) |
+| **안정성** | 낮음 (프레임마다 변함) | 높음 (태그 신뢰도 기반) |
+| **출력 토픽** | `/projection/detections_6dof` | `/realtime_detect/box_poses` |
+| **특징** | 조명 변화 견고, 카메라 자유도 높음 | 정확함, 태그 필수 |
+
+### 포즈 비교 분석 워크플로우
+
+#### 1단계: 두 포즈 시스템 동시 실행
+
+```bash
+# Terminal 1: SAM3 기반 6DOF (기존 시스템)
+ros2 launch projection_plane projection_plane.launch.py
+ros2 launch projection_sam3 projection_sam3.launch.py
+ros2 launch projection_sam3 detections_6dof_converter.launch.py
+
+# Terminal 2: AprilTag 기반 6DOF (신규 시스템)
+ros2 launch realtime_detect apriltag_box_pose.launch.py
+
+# Terminal 3: 데이터 기록
+ros2 bag record \
+  /projection/detections_6dof \
+  /realtime_detect/box_poses \
+  /projection/image \
+  -o comparison_data
+```
+
+#### 2단계: 실시간 포즈 모니터링
+
+**SAM3 기반 포즈 확인:**
+```bash
+ros2 topic echo /projection/detections_6dof --once
+# 출력:
+# detections[0]:
+#   id: 0
+#   position: {x: 0.334, y: 1.171, z: 0.223}
+#   orientation: {x: 0.123, y: 0.456, z: 0.789, w: 0.999}
+#   confidence: 0.843
+```
+
+**AprilTag 기반 포즈 확인:**
+```bash
+ros2 topic echo /realtime_detect/box_poses --once
+# 출력:
+# poses[0]:
+#   position: {x: 0.335, y: 1.172, z: 0.225}
+#   orientation: {x: 0.122, y: 0.455, z: 0.788, w: 1.000}
+```
+
+#### 3단계: 포즈 오차 계산
+
+**Python 스크립트로 포즈 비교 분석:**
+
+```python
+#!/usr/bin/env python3
+"""
+AprilTag vs SAM3 포즈 비교 분석 도구
+"""
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseArray
+from vision_msgs.msg import Detection3DArray
+from tf_transformations import euler_from_quaternion
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+
+class PoseComparison(Node):
+    def __init__(self):
+        super().__init__('pose_comparison_node')
+
+        self.sam3_poses = None
+        self.apriltag_poses = None
+        self.comparison_data = []
+
+        # 구독자 설정
+        self.create_subscription(
+            Detection3DArray,
+            '/projection/detections_6dof',
+            self.sam3_callback,
+            10
+        )
+
+        self.create_subscription(
+            PoseArray,
+            '/realtime_detect/box_poses',
+            self.apriltag_callback,
+            10
+        )
+
+        # 타이머: 1초마다 비교 수행
+        self.create_timer(1.0, self.compare_poses)
+
+        self.output_dir = Path('/tmp/pose_comparison')
+        self.output_dir.mkdir(exist_ok=True)
+
+    def sam3_callback(self, msg):
+        """SAM3 기반 포즈 수신"""
+        self.sam3_poses = msg
+
+    def apriltag_callback(self, msg):
+        """AprilTag 기반 포즈 수신"""
+        self.apriltag_poses = msg
+
+    def compare_poses(self):
+        """두 포즈 시스템 비교"""
+        if self.sam3_poses is None or self.apriltag_poses is None:
+            return
+
+        # 포즈 개수 확인
+        n_sam3 = len(self.sam3_poses.detections)
+        n_apriltag = len(self.apriltag_poses.poses)
+
+        self.get_logger().info(
+            f"Comparing: SAM3={n_sam3} vs AprilTag={n_apriltag}"
+        )
+
+        # 공통 ID에 대해 오차 계산
+        for i in range(min(n_sam3, n_apriltag)):
+            sam3_det = self.sam3_poses.detections[i]
+            apriltag_pose = self.apriltag_poses.poses[i]
+
+            # 위치 오차 (meters)
+            pos_error = np.linalg.norm([
+                sam3_det.results[0].pose.pose.position.x - apriltag_pose.position.x,
+                sam3_det.results[0].pose.pose.position.y - apriltag_pose.position.y,
+                sam3_det.results[0].pose.pose.position.z - apriltag_pose.position.z
+            ])
+
+            # 방향 오차 (degrees)
+            quat_sam3 = [
+                sam3_det.results[0].pose.pose.orientation.x,
+                sam3_det.results[0].pose.pose.orientation.y,
+                sam3_det.results[0].pose.pose.orientation.z,
+                sam3_det.results[0].pose.pose.orientation.w
+            ]
+            quat_apriltag = [
+                apriltag_pose.orientation.x,
+                apriltag_pose.orientation.y,
+                apriltag_pose.orientation.z,
+                apriltag_pose.orientation.w
+            ]
+
+            euler_sam3 = euler_from_quaternion(quat_sam3)
+            euler_apriltag = euler_from_quaternion(quat_apriltag)
+
+            angle_error = np.degrees(np.linalg.norm(
+                np.array(euler_sam3) - np.array(euler_apriltag)
+            ))
+
+            # 데이터 저장
+            self.comparison_data.append({
+                'timestamp': datetime.now().isoformat(),
+                'detection_id': i,
+                'sam3_x': sam3_det.results[0].pose.pose.position.x,
+                'sam3_y': sam3_det.results[0].pose.pose.position.y,
+                'sam3_z': sam3_det.results[0].pose.pose.position.z,
+                'apriltag_x': apriltag_pose.position.x,
+                'apriltag_y': apriltag_pose.position.y,
+                'apriltag_z': apriltag_pose.position.z,
+                'position_error_m': pos_error,
+                'angle_error_deg': angle_error,
+            })
+
+            self.get_logger().info(
+                f"  Detection {i}: pos_error={pos_error:.4f}m, "
+                f"angle_error={angle_error:.2f}°"
+            )
+
+        # 주기적으로 CSV 저장 (100개 샘플마다)
+        if len(self.comparison_data) % 100 == 0:
+            self.save_comparison_csv()
+
+    def save_comparison_csv(self):
+        """비교 데이터를 CSV로 저장"""
+        df = pd.DataFrame(self.comparison_data)
+        output_file = self.output_dir / f'comparison_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+        df.to_csv(output_file, index=False)
+
+        # 통계 출력
+        if len(df) > 0:
+            self.get_logger().info(
+                f"Saved {len(df)} comparisons to {output_file}\n"
+                f"  Position error: mean={df['position_error_m'].mean():.4f}m, "
+                f"std={df['position_error_m'].std():.4f}m\n"
+                f"  Angle error: mean={df['angle_error_deg'].mean():.2f}°, "
+                f"std={df['angle_error_deg'].std():.2f}°"
+            )
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PoseComparison()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+#### 4단계: 실제 위치와 비교 (Ground Truth)
+
+AprilTag는 **정확한 기하학**을 기반으로 하므로 Ground Truth로 사용할 수 있습니다:
+
+```bash
+# AprilTag 포즈를 기준으로 하고 SAM3 포즈와 비교
+# AprilTag 포즈 = Ground Truth (카메라 보정 및 태그 기하학 기반)
+# SAM3 포즈 = 추정값
+
+# 분석 스크립트
+python3 analyze_pose_accuracy.py \
+  --apriltag_poses /tmp/pose_comparison/apriltag.csv \
+  --sam3_poses /tmp/pose_comparison/sam3.csv \
+  --output_report /tmp/pose_comparison/accuracy_report.html
+```
+
+### 포즈 검증 메트릭
+
+#### 위치 정확도 (Position Accuracy)
+```
+오차 = √((Δx)² + (Δy)² + (Δz)²)
+
+예상 범위:
+- 우수: < 0.05m (5cm)
+- 양호: 0.05-0.1m (5-10cm)
+- 부정확: > 0.1m (10cm)
+```
+
+#### 방향 정확도 (Orientation Accuracy)
+```
+오차 = arccos(|q1·q2|) × 2 × (180/π)  [도 단위]
+
+예상 범위:
+- 우수: < 5°
+- 양호: 5-15°
+- 부정확: > 15°
+```
+
+#### 신뢰도 점수 (Confidence Score)
+```
+신뢰도 = (1 - pos_error/0.1) × (1 - angle_error/30) × detection_confidence
+
+범위: 0.0 ~ 1.0
+- 0.8 이상: 높은 신뢰도 (pick & place 가능)
+- 0.5-0.8: 중간 신뢰도 (검증 필수)
+- 0.5 미만: 낮은 신뢰도 (재시도 권장)
+```
+
+### CSV 출력 형식
+
+**SAM3 6DOF (Auto-saved):**
+```
+/home/jack/ros2_ws/runs/segment/predictN/detections_6dof_log.csv
+
+timestamp,detection_id,pos_x,pos_y,pos_z,quat_x,quat_y,quat_z,quat_w,euler_roll,euler_pitch,euler_yaw,confidence,num_points,processing_time_ms
+2026-02-26T14:30:45.123,0,0.334,1.171,0.223,0.123,0.456,0.789,0.999,0.100,1.543,1.540,0.843,1312380,470.6
+```
+
+**AprilTag Poses (Manual record):**
+```
+ros2 bag record /realtime_detect/box_poses -o apriltag_comparison
+
+# Python에서 읽기:
+from rosbag2_py import SequentialReader
+reader = SequentialReader()
+reader.open('apriltag_comparison')
+for msg_type, msg, timestamp in reader.read_messages():
+    print(f"{timestamp}: {msg}")
+```
+
+### 실제 위치(실측값) 입력 및 비교
+
+**수동으로 실제 위치 측정:**
+
+```bash
+# 각 상자의 실제 위치를 측정 (줄자 사용)
+# 파일: ~/ros2_ws/ground_truth.csv
+
+detection_id,real_x,real_y,real_z,real_roll,real_pitch,real_yaw,measurement_method,notes
+0,0.335,1.170,0.225,0.095,1.540,1.535,ruler,Measured from world origin
+1,0.450,2.100,0.320,0.105,1.550,1.545,ruler,
+...
+```
+
+**Python 검증 스크립트:**
+
+```python
+import pandas as pd
+import numpy as np
+
+# 데이터 로드
+ground_truth = pd.read_csv('ground_truth.csv')
+sam3_poses = pd.read_csv('/home/jack/ros2_ws/runs/segment/predictN/detections_6dof_log.csv')
+apriltag_poses = pd.read_csv('apriltag_poses.csv')  # ros2 bag에서 추출
+
+# 오차 계산
+sam3_errors = []
+apriltag_errors = []
+
+for idx, gt_row in ground_truth.iterrows():
+    det_id = gt_row['detection_id']
+
+    # SAM3 오차
+    sam3_row = sam3_poses[sam3_poses['detection_id'] == det_id].iloc[0]
+    sam3_pos_error = np.linalg.norm([
+        sam3_row['pos_x'] - gt_row['real_x'],
+        sam3_row['pos_y'] - gt_row['real_y'],
+        sam3_row['pos_z'] - gt_row['real_z']
+    ])
+    sam3_errors.append(sam3_pos_error)
+
+    # AprilTag 오차
+    apriltag_row = apriltag_poses[apriltag_poses['detection_id'] == det_id].iloc[0]
+    apriltag_pos_error = np.linalg.norm([
+        apriltag_row['pos_x'] - gt_row['real_x'],
+        apriltag_row['pos_y'] - gt_row['real_y'],
+        apriltag_row['pos_z'] - gt_row['real_z']
+    ])
+    apriltag_errors.append(apriltag_pos_error)
+
+# 결과 출력
+print("=" * 60)
+print("POSE ACCURACY COMPARISON (vs Ground Truth)")
+print("=" * 60)
+print(f"\n📊 SAM3-based 6DOF:")
+print(f"   Mean error:  {np.mean(sam3_errors):.4f}m")
+print(f"   Std dev:     {np.std(sam3_errors):.4f}m")
+print(f"   Max error:   {np.max(sam3_errors):.4f}m")
+print(f"   Min error:   {np.min(sam3_errors):.4f}m")
+
+print(f"\n📊 AprilTag-based 6DOF:")
+print(f"   Mean error:  {np.mean(apriltag_errors):.4f}m")
+print(f"   Std dev:     {np.std(apriltag_errors):.4f}m")
+print(f"   Max error:   {np.max(apriltag_errors):.4f}m")
+print(f"   Min error:   {np.min(apriltag_errors):.4f}m")
+
+# 성능 비교
+improvement = (np.mean(sam3_errors) - np.mean(apriltag_errors)) / np.mean(sam3_errors) * 100
+print(f"\n✨ AprilTag improvement: {improvement:+.1f}%")
+```
+
+### 시각화 및 분석 도구
+
+```bash
+# RViz에서 두 포즈 동시 시각화
+rviz2
+
+# 추가할 디스플레이:
+# 1. SAM3 포즈: /projection/detections_6dof (MarkerArray - 빨간 화살표)
+# 2. AprilTag 포즈: /realtime_detect/box_poses (PoseArray - 녹색 화살표)
+# 3. Ground Truth: Static TF markers (파란 상자)
+
+# 결과: 세 종류 포즈를 동시에 보고 비교 가능!
+```
+
+### 권장사항
+
+| 상황 | 추천 |
+|------|------|
+| 높은 정확도 필요 (pick & place) | **AprilTag 우선** (±5cm) |
+| 자유도 높은 촬영각 | **SAM3 사용** (제약 없음) |
+| 최대 정확도 원함 | **두 시스템 앙상블** (평균/투표) |
+| 실시간 성능 중요 | **AprilTag** (50-100ms) |
+| 조명 변화 많음 | **SAM3** (더 견고) |
+
+---
+
 ## 🚀 다음 단계
 
 ### 개선 사항 (진행 중)
