@@ -7,6 +7,11 @@
 
 ---
 
+<img width="724" height="360" alt="image" src="https://github.com/user-attachments/assets/74c6a523-16cc-49e2-b0c9-c4b792f1ba55" />
+
+
+---
+
 ## 📋 목차
 
 1. [프로젝트 개요](#-프로젝트-개요)
