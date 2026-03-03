@@ -7,8 +7,7 @@
 
 ---
 
-<img width="724" height="360" alt="image" src="https://github.com/projection_plane/test_video.gif" />
-
+![test_video](https://github.com/jack0682/Projection_plane/raw/main/test_video.gif)
 
 ---
 
